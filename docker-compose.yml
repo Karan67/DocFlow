@@ -20,7 +20,9 @@ x-app: &app
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector's image is stock Postgres 16 plus the vector extension, used for
+    # the embeddings written in Phase 3.
+    image: pgvector/pgvector:pg16
     container_name: docflow_postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-docflow}

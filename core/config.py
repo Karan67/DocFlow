@@ -50,6 +50,30 @@ class Settings(BaseSettings):
     #: How often the reaper sweeps for orphaned jobs.
     REAPER_INTERVAL_SECONDS: int = 300
 
+    # --- Phase 3: processing pipeline ---
+    #: A PDF whose text layer yields fewer than this many characters per page
+    #: is treated as scanned and routed to OCR instead.
+    OCR_MIN_CHARS_PER_PAGE: int = 40
+    OCR_LANGUAGE: str = "eng"
+    OCR_DPI: int = 200
+    #: OCR is orders of magnitude slower than reading a text layer. Cap the
+    #: page count so one huge scan cannot blow through TASK_HARD_TIME_LIMIT.
+    OCR_MAX_PAGES: int = 20
+    #: OCR gets its own, much longer limits. Measured at roughly 4s per page
+    #: warm, so OCR_MAX_PAGES pages need far more headroom than the global
+    #: default - which stays tight for the fast stages. STALE_JOB_SECONDS must
+    #: remain above OCR_HARD_TIME_LIMIT or the reaper would steal running work.
+    OCR_SOFT_TIME_LIMIT: int = 600
+    OCR_HARD_TIME_LIMIT: int = 660
+
+    EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
+    #: Must match the model. Changing one without the other fails at insert
+    #: time against the vector(N) column.
+    EMBEDDING_DIM: int = 384
+    CHUNK_SIZE: int = 800
+    CHUNK_OVERLAP: int = 150
+    EMBEDDING_BATCH_SIZE: int = 32
+
     LOG_LEVEL: str = "INFO"
     CORS_ORIGINS: list[str] = ["http://localhost:3001", "http://127.0.0.1:3001"]
 

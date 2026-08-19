@@ -73,14 +73,41 @@ Deferred deliberately: fault injection in production code. The retry paths are
 covered by tests that monkeypatch the extractor, so nothing test-only ships in
 the worker.
 
-## Phase 3 — Real processing ⬅ next
+## Phase 3 — Real processing ✅ done
 
-- OCR via `pytesseract` (needs `tesseract-ocr` + `poppler-utils` in the image)
-- Second job type: embedding generation
-- Chain them with Celery `chain()` — and decide deliberately how a mid-chain
-  failure is represented in the parent job's status
+- ✅ OCR via `pytesseract` + `poppler-utils`, as its own pipeline stage rather
+  than a fallback inside extraction — a 2ms task and a 60s task should not
+  share a name
+- ✅ Routing decided **per page**: `needs_ocr` compares chars/page against a
+  threshold, so a 50-page scan carrying 200 chars of logo text still gets OCR'd
+- ✅ Embeddings via `fastembed` (ONNX on CPU — no torch, so the image stays in
+  the hundreds of MB) into pgvector, with an HNSW cosine index ready for search
+- ✅ Stages dispatch explicitly instead of Celery `chain()` — the route is not
+  known up front, and a static chain cannot branch on a result
+- ✅ A mid-pipeline failure is attributed to its stage: job status says it
+  failed, the `stages` log says where, and earlier stages' output survives
+- ✅ Per-stage retry budgets, with attempt counts preserved in the stage log
+- ✅ OCR-specific time limits; the embedding model preloaded at worker start
 
-## Phase 4 — Scale
+Schema (migration `0003`): `stage`, `stages`, the `vector` extension, and a
+`document_chunks` table with an HNSW index.
+
+**Done when:** a scan and a digital PDF both come out the far end correctly.
+✅ Verified: 47 tests green, plus live runs through the real broker — a
+born-digital PDF took the `extract_text → embed` path, and an image-only PDF
+took `extract_text → ocr → embed`, recovering 351 characters from pure pixels
+and landing a 384-dimensional vector in pgvector. Warm pipeline: 2ms + 784ms +
+248ms.
+
+Two findings worth keeping:
+- The first cold run took 67s (OCR) + 58s (embed) because the embedding model
+  loaded lazily while OCR competed for CPU. Preloading in `worker_process_init`
+  cut the warm pipeline to about a second.
+- The original test fixtures put one short line per page — 33 chars/page, below
+  the 40 threshold — so they were correctly classified as scans. The threshold
+  was right; the fixtures were unrealistic. They now build realistic pages.
+
+## Phase 4 — Scale ⬅ next
 
 - **Separate queues (`high` / `default` / `low`) routed with `-Q`, not Redis
   priority values.** Celery's numeric priority over Redis is implemented as
@@ -124,3 +151,6 @@ Flower cover everything until there is something worth showing.
 | `autoretry_for` + `retry_backoff` | explicit `self.retry()` with failures classified first | `autoretry_for` retries *everything*, including corrupt input that can never succeed. Classifying first is the difference between a retry policy and a busy-wait |
 | "after `max_retries`, mark permanently FAILED" | a distinct `DEAD_LETTER` status | "we gave up" and "this input was never going to work" need different responses; merging them makes the failure list unactionable |
 | plain unique index on `idempotency_key` | *partial* unique index excluding failed jobs | A plain unique index would permanently block re-uploading a file whose job failed |
+| "embedding generation as a second job type" | one job row that advances through stages | The question people ask is "is my document ready?", not "did stage two finish?". A row per step needs a second grouping concept immediately |
+| Celery `chain()` | explicit stage dispatch | Whether OCR runs depends on what extraction finds; a static chain cannot branch on a result |
+| OCR as a fallback inside `extract_text` | OCR as its own stage | Reading a text layer is microseconds, OCR is seconds per page. One name for both makes queue behaviour unpredictable |

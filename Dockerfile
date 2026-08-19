@@ -6,25 +6,40 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    FASTEMBED_CACHE_PATH=/opt/fastembed
 
 WORKDIR /app
 
-# curl is used by the compose healthcheck.
+# curl        - compose healthcheck
+# tesseract   - OCR engine; -eng is a separate package and is NOT pulled in by
+#               --no-install-recommends, so it must be named explicitly
+# poppler     - pdftoppm, which pdf2image shells out to for page rendering
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends \
+      curl \
+      tesseract-ocr \
+      tesseract-ocr-eng \
+      poppler-utils \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
+
+RUN useradd --create-home --uid 1000 appuser
+
+# Bake the embedding model into the image. Downloading it lazily on the first
+# task would make that job slow and put a network dependency in the hot path.
+RUN mkdir -p "$FASTEMBED_CACHE_PATH" \
+ && python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='$FASTEMBED_CACHE_PATH')" \
+ && chown -R appuser:appuser "$FASTEMBED_CACHE_PATH"
 
 COPY . .
 
 # Create the upload directory, owned by appuser, BEFORE the named volume is
 # first mounted: Docker seeds an empty named volume from the image directory,
 # ownership included. Skip this and the non-root process cannot write to it.
-RUN useradd --create-home --uid 1000 appuser \
- && mkdir -p /data/uploads \
+RUN mkdir -p /data/uploads \
  && chown -R appuser:appuser /data/uploads /app
 
 USER appuser

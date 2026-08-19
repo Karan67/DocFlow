@@ -113,7 +113,7 @@ def upload_job(
     job = Job(
         file_name=file_name,
         file_path=stored.key,
-        job_type=JobType.EXTRACT_TEXT.value,
+        job_type=JobType.DOCUMENT.value,
         status=JobStatus.PENDING.value,
         max_retries=settings.DEFAULT_MAX_RETRIES,
         idempotency_key=stored.sha256,

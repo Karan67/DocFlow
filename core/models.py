@@ -11,9 +11,22 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, Index, Integer, Text, func, text
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from core.config import settings
 
 
 class Base(DeclarativeBase):
@@ -34,7 +47,25 @@ class JobStatus(str, Enum):
 
 
 class JobType(str, Enum):
+    #: One upload = one job that walks the whole ingestion pipeline.
+    DOCUMENT = "document"
+
+
+class JobStage(str, Enum):
+    """Steps a document job walks through.
+
+    A job is a *pipeline*, not a single step: one row advances through these
+    stages rather than spawning a row per step. That keeps "is my document
+    ready?" a single lookup, and lets every stage reuse the Phase 2 retry and
+    dead-letter machinery unchanged.
+    """
+
+    #: Read the PDF's embedded text layer.
     EXTRACT_TEXT = "extract_text"
+    #: Only entered when the text layer is empty or near-empty (a scan).
+    OCR = "ocr"
+    #: Chunk the text and write vectors.
+    EMBED = "embed"
 
 
 #: Statuses from which no further transition is possible.
@@ -56,6 +87,10 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
             JobStatus.FAILED,
             JobStatus.RETRYING,
             JobStatus.DEAD_LETTER,
+            # A finished stage with more work ahead goes back to PENDING: the
+            # next stage is queued and waiting for a worker, which is exactly
+            # what PENDING means.
+            JobStatus.PENDING,
         }
     ),
     JobStatus.RETRYING: frozenset(
@@ -84,6 +119,9 @@ class Job(Base):
             name="ck_jobs_status",
         ),
         CheckConstraint("retry_count >= 0", name="ck_jobs_retry_count_non_negative"),
+        CheckConstraint(
+            "stage IN ('extract_text', 'ocr', 'embed')", name="ck_jobs_stage"
+        ),
         Index("ix_jobs_created_at", text("created_at DESC")),
         Index("ix_jobs_status", "status"),
     )
@@ -122,6 +160,20 @@ class Job(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    #: The pipeline step currently running (or the one that failed).
+    stage: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default=JobStage.EXTRACT_TEXT.value,
+        server_default=text("'extract_text'"),
+    )
+    #: Append-only record of every stage the job has completed: status,
+    #: duration and a per-stage detail blob. This is what makes a mid-pipeline
+    #: failure legible - the job status says it failed, `stages` says where.
+    stages: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -134,3 +186,40 @@ class Job(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<Job {self.id} {self.job_type} {self.status}>"
+
+
+class DocumentChunk(Base):
+    """One embedded slice of a document's text.
+
+    Chunks are deleted with their job (ON DELETE CASCADE) so a re-run cannot
+    leave orphaned vectors behind.
+    """
+
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        UniqueConstraint("job_id", "chunk_index", name="uq_document_chunks_job_index"),
+        Index("ix_document_chunks_job_id", "job_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(settings.EMBEDDING_DIM), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<DocumentChunk job={self.job_id} #{self.chunk_index}>"
