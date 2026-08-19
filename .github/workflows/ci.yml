@@ -70,7 +70,11 @@ jobs:
         # CI on the same image the local stack uses, rather than a third party
         # repackage whose tags can disappear underneath us.
         run: |
-          docker run -d --name minio -p 9000:9000             -e MINIO_ROOT_USER=docflow             -e MINIO_ROOT_PASSWORD=docflowsecret             minio/minio:latest server /data
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=docflow \
+            -e MINIO_ROOT_PASSWORD=docflowsecret \
+            minio/minio:latest server /data
 
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then
