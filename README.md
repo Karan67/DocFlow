@@ -4,8 +4,8 @@ Upload a document, get a job id back immediately, poll for the result. The API
 never does the slow work — Celery workers do, in separate processes that can
 crash and restart without taking the API down.
 
-**Status: Phase 1 complete.** One job type (`extract_text`), end-to-end.
-See [PLAN.md](PLAN.md) for the full roadmap.
+**Status: Phase 2 complete.** One job type (`extract_text`), end-to-end, with
+retries, dead-lettering and idempotency. See [PLAN.md](PLAN.md) for the roadmap.
 
 ```
 POST /jobs/upload ──> FastAPI ──> Postgres (job row, PENDING)
@@ -13,9 +13,14 @@ POST /jobs/upload ──> FastAPI ──> Postgres (job row, PENDING)
                          └──────> Redis queue
                                      │
                                      ▼
-                              Celery worker ──> PROCESSING ──> DONE | FAILED
-                                     │                              │
-GET /jobs/{id} <── FastAPI <── Postgres <─────────────────────────────┘
+                              Celery worker ──> PROCESSING ──> DONE
+                                     │             │  ▲          │
+                                     │             │  └─ RETRYING┤ (backoff)
+                                     │             │             │
+                                     │             └─> FAILED    │ (bad input)
+                                     │                 DEAD_LETTER (out of retries)
+                                     ▼                           │
+GET /jobs/{id} <── FastAPI <── Postgres <─────────────────────────┘
 ```
 
 ---
@@ -26,7 +31,7 @@ GET /jobs/{id} <── FastAPI <── Postgres <──────────�
 docker compose up -d --build
 ```
 
-Five containers come up: `postgres`, `redis`, `api`, `worker`, `flower`.
+Six containers come up: `postgres`, `redis`, `api`, `worker`, `beat`, `flower`.
 Migrations run automatically before the API starts serving.
 
 | Service | URL | Note |
@@ -37,6 +42,9 @@ Migrations run automatically before the API starts serving.
 | Flower | http://localhost:5556 | Queue depth, task history, failures |
 | Postgres | `localhost:5433` | user/pass/db: `docflow` |
 | Redis | `localhost:6380` | |
+
+`beat` has no port — it is the scheduler that fires the stale-job reaper. Run
+exactly one of it; two would double-fire every scheduled task.
 
 Host ports are deliberately non-default (5433/6380/8001) so this stack can run
 alongside other local projects. Override them in a `.env` file — see
@@ -69,8 +77,27 @@ docker compose logs -f worker
 | `GET` | `/jobs` | Recent jobs, newest first. `?limit=`, `?offset=`, `?status=` |
 | `GET` | `/health` | Readiness probe |
 
-Phase 1 accepts `.pdf` only (`415` otherwise), rejects empty files (`400`) and
-uploads over `MAX_UPLOAD_BYTES` (`413`).
+Currently accepts `.pdf` only (`415` otherwise), rejects empty files (`400`)
+and uploads over `MAX_UPLOAD_BYTES` (`413`).
+
+Uploading a file whose content is already in the pipeline returns **`200` with
+`deduplicated: true`** and the original `job_id`, rather than `202`. Nothing new
+was accepted, so it is not a "created" response.
+
+### Job statuses
+
+| Status | Meaning |
+|---|---|
+| `PENDING` | Queued, not yet picked up |
+| `PROCESSING` | A worker has it now |
+| `RETRYING` | Transient failure; next attempt due at `next_retry_at` |
+| `DONE` | Succeeded; output in `result` |
+| `FAILED` | Permanent failure — the input is bad, retrying cannot help |
+| `DEAD_LETTER` | Gave up after exhausting `max_retries` |
+
+`FAILED` and `DEAD_LETTER` are deliberately distinct: "this file was never
+going to work" and "we kept trying and gave up" need different responses, and
+mixing them makes the failure list useless.
 
 ---
 
@@ -117,12 +144,56 @@ rather than leaving it PENDING with nothing to pick it up.
 FastAPI runs plain `def` endpoints in a threadpool, so one driver and one
 session factory covers both halves — no async/sync bridging.
 
-**Status is `TEXT` + a `CHECK` constraint, not a Postgres enum.** Phase 2 adds
-`RETRYING`; widening a check constraint is a much simpler migration than
-`ALTER TYPE`.
+**Status is `TEXT` + a `CHECK` constraint, not a Postgres enum.** Phase 2 added
+`RETRYING` and `DEAD_LETTER`; widening a check constraint is a drop-and-recreate
+inside the migration, whereas `ALTER TYPE ... ADD VALUE` cannot run in a
+transactional migration at all.
 
 **`file_path` stores an opaque storage key, not an absolute path.** Phase 6
 swaps `LocalDiskStorage` for S3 behind the same interface, with no migration.
+
+### Reliability (Phase 2)
+
+**Failures are classified before they are retried.** A corrupt PDF fails
+permanently and immediately; a database blip or I/O error is retried with
+backoff. Retrying bad input three times just burns the retry budget and a
+worker slot for a result that cannot change. See `PERMANENT_ERRORS` in
+[worker/tasks.py](worker/tasks.py).
+
+**`acks_late=True`.** The broker acknowledges a message only once the task
+finishes, so a SIGKILLed worker's task is redelivered rather than lost. This is
+only safe because tasks are idempotent — which is what the terminal-status
+guard and the content-hash key provide.
+
+**Redelivery costs a retry.** `task_reject_on_worker_lost` can loop forever for
+a task that reliably kills its worker (OOM being the classic). Reclaiming an
+orphaned job increments `retry_count`, so the loop terminates in a dead letter
+instead of running until someone notices.
+
+**The retry budget lives in Postgres, not Celery.** `max_retries` is a column,
+so the budget survives a worker restart and is visible to anyone reading the
+database. Celery's own ceiling is disabled (`max_retries=None`) to keep one
+source of truth.
+
+**Backoff has jitter.** Without it, a batch of jobs that fail together retries
+in lockstep and hammers whatever just recovered.
+
+**Idempotency is keyed on the SHA-256 of the content**, under a *partial*
+unique index that excludes `FAILED` and `DEAD_LETTER`. So re-uploading a file
+that is queued, running or done returns the original job, while re-uploading
+one that failed is allowed a fresh attempt. The index — not the lookup — is the
+real guard: a concurrent duplicate upload loses the race with an
+`IntegrityError` and is handed the winning job.
+
+**The reaper covers what `acks_late` cannot.** Redis redelivers unacked
+messages after the visibility timeout, but a genuinely lost message leaves a
+job in `PROCESSING` with nothing left to move it. A Celery Beat sweep every
+5 minutes reclaims those, and `SELECT ... FOR UPDATE SKIP LOCKED` keeps
+overlapping sweeps from fighting over the same row.
+
+**Time limits are set.** Without `task_time_limit`, one hung task holds a
+concurrency slot forever. `STALE_JOB_SECONDS` sits well above the hard limit so
+the reaper never steals a job that is legitimately still running.
 
 ---
 
@@ -132,14 +203,22 @@ swaps `LocalDiskStorage` for S3 behind the same interface, with no migration.
 docker compose exec api pytest -v
 ```
 
-11 tests: extraction unit tests (no DB or broker), plus integration tests
-covering upload → PENDING → DONE, the failure path, duplicate delivery, and
-input validation.
+27 tests: extraction unit tests (no DB or broker), the full upload → DONE flow,
+and Phase 2's reliability behaviour — retry-then-succeed, dead-lettering after
+the budget is spent, permanent failures skipping retries entirely, backoff
+growth and jitter, deduplication, reclaiming orphaned work, and the reaper.
 
-Note: Celery's `task_always_eager` has **no effect on `app.send_task()`** — it
-only short-circuits `Task.apply_async()`. The integration tests therefore stub
-the send and invoke the task with `.apply()`, which also keeps the producer and
-consumer tested independently.
+Two Celery details that shape how these are written:
+
+`task_always_eager` has **no effect on `app.send_task()`** — it only
+short-circuits `Task.apply_async()`. So the producer side is verified by
+capturing the send, and the consumer side by invoking the task with `.apply()`.
+That also keeps the two halves tested independently, which is how they run.
+
+Under `.apply()`, `self.retry()` re-executes the task **inline** rather than
+scheduling it on the broker, and countdowns are skipped. One call therefore
+drives a whole retry chain synchronously, which is what makes the retry tests
+fast. The database is the assertion target, not the return value.
 
 ---
 
@@ -151,10 +230,21 @@ consumer tested independently.
 volume. Both mount it at `/data/uploads`.
 
 **Editing `worker/tasks.py` changes nothing** — the API runs with `--reload`,
-the worker does not. `docker compose restart worker`.
+the worker and beat do not. `docker compose restart worker beat`.
 
 **Schema changed but the table did not** — migrations run on API startup;
 `docker compose restart api`, or `docker compose exec api alembic upgrade head`.
+
+**A re-upload returns an old job instead of processing** — that is
+deduplication working. Identical bytes map to the same job unless the previous
+one is `FAILED` or `DEAD_LETTER`.
+
+**A job sits in `RETRYING` for a while** — expected. Check `next_retry_at`. With
+the defaults (`RETRY_BACKOFF_BASE=4`, `max_retries=3`) the three waits are
+roughly 4s, 8s and 16s before jitter; the `RETRY_BACKOFF_MAX` cap of 10 minutes
+only comes into play if the retry budget is raised.
+
+**Scheduled tasks fire twice** — more than one `beat` container is running.
 
 **Running Celery natively on Windows** — the prefork pool does not work; use
 `--pool=solo`. Inside Docker (Linux) this is a non-issue.
@@ -166,6 +256,6 @@ That is fine on localhost; it must not be set on a public deployment.
 
 ## Next
 
-Phase 2 is reliability: retry with exponential backoff, dead-letter handling,
-`acks_late`, SHA-256 idempotency keys, and a reaper for jobs orphaned by a dead
-worker. [PLAN.md](PLAN.md) has the detail.
+Phase 3 is real processing: OCR via `pytesseract` for scanned PDFs, an
+embedding job type, and chaining the two with Celery `chain()`.
+[PLAN.md](PLAN.md) has the detail.

@@ -5,8 +5,18 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.schemas import JobCreatedResponse, JobDetail, JobListResponse, JobSummary
@@ -22,6 +32,35 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 ALLOWED_SUFFIXES = {".pdf"}
 
+#: Jobs in these statuses no longer reserve their idempotency key, so the same
+#: file may be uploaded again to get a fresh attempt.
+_DEDUPE_EXEMPT = [JobStatus.FAILED.value, JobStatus.DEAD_LETTER.value]
+
+
+def _find_active_duplicate(db: Session, idempotency_key: str) -> Job | None:
+    """The existing job holding this content hash, if it has not failed."""
+    return db.scalars(
+        select(Job)
+        .where(
+            Job.idempotency_key == idempotency_key,
+            Job.status.notin_(_DEDUPE_EXEMPT),
+        )
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    ).first()
+
+
+def _deduplicated_response(response: Response, existing: Job) -> JobCreatedResponse:
+    # 200 rather than 202: nothing new was accepted for processing.
+    response.status_code = status.HTTP_200_OK
+    return JobCreatedResponse(
+        job_id=existing.id,
+        status=existing.status,
+        job_type=existing.job_type,
+        status_url=f"/jobs/{existing.id}",
+        deduplicated=True,
+    )
+
 
 @router.post(
     "/upload",
@@ -30,6 +69,7 @@ ALLOWED_SUFFIXES = {".pdf"}
     summary="Upload a document and queue it for processing",
 )
 def upload_job(
+    response: Response,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ) -> JobCreatedResponse:
@@ -59,12 +99,24 @@ def upload_job(
         storage.delete(stored.key)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Uploaded file is empty")
 
+    # Idempotency: the content hash identifies the work. Re-uploading a file
+    # that is queued, running or already done returns the original job rather
+    # than processing the same bytes twice.
+    existing = _find_active_duplicate(db, stored.sha256)
+    if existing is not None:
+        storage.delete(stored.key)
+        logger.info(
+            "Upload of %s deduplicated onto existing job %s", file_name, existing.id
+        )
+        return _deduplicated_response(response, existing)
+
     job = Job(
         file_name=file_name,
         file_path=stored.key,
         job_type=JobType.EXTRACT_TEXT.value,
         status=JobStatus.PENDING.value,
         max_retries=settings.DEFAULT_MAX_RETRIES,
+        idempotency_key=stored.sha256,
     )
 
     # Commit BEFORE enqueuing. A worker can pick the task up within
@@ -73,6 +125,20 @@ def upload_job(
     try:
         db.add(job)
         db.commit()
+    except IntegrityError:
+        # Lost a race with a concurrent upload of identical content. The
+        # partial unique index is the real guard - the lookup above is only the
+        # fast path - so fall back to returning whichever job won.
+        db.rollback()
+        storage.delete(stored.key)
+        winner = _find_active_duplicate(db, stored.sha256)
+        if winner is None:
+            logger.exception("Integrity error with no surviving job for %s", file_name)
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, "Could not create the job"
+            )
+        logger.info("Upload of %s lost a dedupe race to job %s", file_name, winner.id)
+        return _deduplicated_response(response, winner)
     except Exception:
         db.rollback()
         storage.delete(stored.key)

@@ -23,6 +23,8 @@ class JobSummary(BaseModel):
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    #: Populated while the job is RETRYING - when the next attempt is due.
+    next_retry_at: datetime | None = None
 
 
 class JobDetail(JobSummary):
@@ -30,6 +32,8 @@ class JobDetail(JobSummary):
 
     result: dict[str, Any] | None = None
     error_message: str | None = None
+    #: SHA-256 of the uploaded content; the deduplication key.
+    idempotency_key: str | None = None
 
 
 class JobListResponse(BaseModel):
@@ -45,6 +49,14 @@ class JobCreatedResponse(BaseModel):
     job_type: str
     status_url: str = Field(
         description="Poll this endpoint for the job's current status."
+    )
+    deduplicated: bool = Field(
+        default=False,
+        description=(
+            "True when identical content was already in the pipeline, so this "
+            "upload returned the existing job instead of creating a new one. "
+            "The response status is 200 rather than 202 in that case."
+        ),
     )
 
 
