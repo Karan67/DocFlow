@@ -94,7 +94,16 @@ CLAIMABLE_STATUSES: frozenset[str] = frozenset(
 
 #: The explicit state machine.
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    JobStatus.PENDING: frozenset({JobStatus.PROCESSING, JobStatus.FAILED}),
+    JobStatus.PENDING: frozenset(
+        {
+            JobStatus.PROCESSING,
+            JobStatus.FAILED,
+            # A job that was committed but never enqueued is revived by the
+            # reaper, and dead-lettered once that has failed max_retries times.
+            # It reaches a terminal state without ever having been PROCESSING.
+            JobStatus.DEAD_LETTER,
+        }
+    ),
     JobStatus.PROCESSING: frozenset(
         {
             JobStatus.DONE,

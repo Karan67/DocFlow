@@ -1,3 +1,7 @@
+# Shared runtime: everything the API, worker, beat and flower all need.
+# Document-processing dependencies live in requirements-worker.txt so the API
+# image does not carry tesseract, poppler or a 130MB embedding model.
+
 # --- API ---
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
@@ -9,6 +13,8 @@ pydantic-settings>=2.6.0
 SQLAlchemy>=2.0.36
 psycopg2-binary>=2.9.10
 alembic>=1.14.0
+# The Job model's sibling table uses a vector column, so both halves import it.
+pgvector>=0.3.6
 
 # --- Queue ---
 celery[redis]>=5.4.0
@@ -18,12 +24,5 @@ flower>=2.0.1
 # --- Rate limiting (Redis-backed, shared across API replicas) ---
 slowapi>=0.1.9
 
-# --- Processing ---
-pypdf>=5.1.0
-# OCR for scanned PDFs with no text layer
-pytesseract>=0.3.13
-pdf2image>=1.17.0
-pillow>=11.0.0
-# Embeddings. fastembed runs ONNX on CPU - no torch, so the image stays small.
-fastembed>=0.4.0
-pgvector>=0.3.6
+# --- Object storage ---
+boto3>=1.35.0

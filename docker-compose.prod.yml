@@ -1,0 +1,83 @@
+# Production overlay.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     up -d api worker worker-ocr beat flower frontend
+#
+# Services are named explicitly because the base file also defines postgres,
+# redis and minio - in production those are RDS, ElastiCache and S3, not
+# containers. Point DATABASE_URL / REDIS_URL at the managed services.
+#
+# Differences from local development:
+#   * lean `worker` build target instead of `dev` (no test dependencies)
+#   * no source bind-mount and no --reload; the code is baked into the image
+#   * S3 rather than the shared volume, with no endpoint override so boto3
+#     resolves real AWS
+#   * no credentials in the environment - the instance role supplies them
+
+x-prod-app: &prod-app
+  restart: always
+  # Overrides the base file's list, dropping the `.:/app` source mount. The
+  # uploads volume goes too: with S3 there is nothing local to share.
+  volumes: []
+  environment:
+    DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to the managed Postgres}
+    REDIS_URL: ${REDIS_URL:?set REDIS_URL to the managed Redis}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-25000000}
+    STORAGE_BACKEND: s3
+    S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET}
+    S3_PREFIX: ${S3_PREFIX:-uploads/}
+    AWS_REGION: ${AWS_REGION:-us-east-1}
+    # S3_ENDPOINT_URL deliberately unset: boto3 resolves the real AWS endpoint
+    # from the region. AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are also
+    # absent so boto3 falls through to the instance role.
+    TRUSTED_PROXY_COUNT: ${TRUSTED_PROXY_COUNT:-1}
+    RATE_LIMIT_UPLOAD: ${RATE_LIMIT_UPLOAD:-30/minute}
+
+services:
+  api:
+    <<: *prod-app
+    build:
+      context: .
+      target: api
+    command: ["sh", "/app/scripts/start-api.sh"]
+
+  worker:
+    <<: *prod-app
+    build:
+      context: .
+      target: worker
+
+  worker-ocr:
+    <<: *prod-app
+    build:
+      context: .
+      target: worker
+
+  beat:
+    <<: *prod-app
+    build:
+      context: .
+      target: worker
+
+  flower:
+    <<: *prod-app
+    build:
+      context: .
+      target: worker
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    command: >
+      celery -A worker.celery_app flower --address=0.0.0.0 --port=5555
+      --basic_auth=${FLOWER_USER:?set FLOWER_USER}:${FLOWER_PASSWORD:?set FLOWER_PASSWORD}
+
+  frontend:
+    restart: always
+    build:
+      context: ./frontend
+      args:
+        # Must be the public API address - this is inlined into the browser
+        # bundle at build time, so changing it needs a rebuild.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:?set the public API URL}

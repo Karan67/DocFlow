@@ -644,8 +644,10 @@ def reap_stale_jobs() -> dict[str, Any]:
     forever with nothing left to move them.
     """
     cutoff = _now() - timedelta(seconds=settings.STALE_JOB_SECONDS)
+    pending_cutoff = _now() - timedelta(seconds=settings.ORPHANED_PENDING_SECONDS)
     requeue: list[tuple[uuid.UUID, str, str]] = []
     dead_lettered = 0
+    revived = 0
 
     with session_scope() as session:
         stale = session.scalars(
@@ -687,14 +689,63 @@ def reap_stale_jobs() -> dict[str, Any]:
                 (job.id, STAGE_TASKS[job.stage], queue_for(job.stage, job.priority))
             )
 
+        # Jobs that were committed but never enqueued: the API died between the
+        # commit and the send_task. Nothing else will ever move them, because
+        # the sweep above only looks at PROCESSING.
+        #
+        # Re-enqueuing is safe even if the message does exist after all - the
+        # claim step skips anything already in flight or settled. The threshold
+        # is deliberately long so an ordinary backlog is never disturbed.
+        orphaned = session.scalars(
+            select(Job)
+            .where(
+                Job.status == JobStatus.PENDING.value,
+                Job.started_at.is_(None),
+                Job.created_at < pending_cutoff,
+            )
+            .order_by(Job.created_at)
+            .limit(100)
+            .with_for_update(skip_locked=True)
+        ).all()
+
+        for job in orphaned:
+            age = _age_seconds(job.created_at)
+            if job.retry_count >= job.max_retries:
+                _dead_letter(
+                    job,
+                    f"Never enqueued; still PENDING after {age:.0f}s and the "
+                    f"retry budget is exhausted",
+                )
+                _append_stage_entry(
+                    job, job.stage, JobStatus.DEAD_LETTER.value, {"reason": "never_enqueued"}
+                )
+                dead_lettered += 1
+                continue
+
+            # Charge a retry so a job whose enqueue keeps failing cannot be
+            # revived forever.
+            job.retry_count += 1
+            job.error_message = (
+                f"Re-enqueued by the reaper after {age:.0f}s stuck in PENDING"
+            )
+            revived += 1
+            requeue.append(
+                (job.id, STAGE_TASKS[job.stage], queue_for(job.stage, job.priority))
+            )
+
     # Same rule as the upload route: commit first, enqueue second.
     for job_id, task_name, queue_name in requeue:
         celery_app.send_task(task_name, args=[str(job_id)], queue=queue_name)
 
     if requeue or dead_lettered:
         logger.warning(
-            "Reaper requeued %s and dead-lettered %s stale job(s)",
+            "Reaper requeued %s (%s never enqueued) and dead-lettered %s job(s)",
             len(requeue),
+            revived,
             dead_lettered,
         )
-    return {"requeued": len(requeue), "dead_lettered": dead_lettered}
+    return {
+        "requeued": len(requeue),
+        "revived_pending": revived,
+        "dead_lettered": dead_lettered,
+    }

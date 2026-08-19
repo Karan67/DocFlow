@@ -1,6 +1,6 @@
 """Phase 3: OCR routing, embeddings, and multi-stage pipeline behaviour.
 
-Run inside the api container:  docker compose exec api pytest
+Run inside the worker container:  docker compose exec worker pytest
 
 The routing decision is the interesting part. A born-digital PDF has a text
 layer and skips OCR entirely; a scan has none and must be recognised. Getting

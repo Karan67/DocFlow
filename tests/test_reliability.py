@@ -1,6 +1,6 @@
 """Phase 2: retries with backoff, dead-lettering, idempotency and the reaper.
 
-Run inside the api container:  docker compose exec api pytest
+Run inside the worker container:  docker compose exec worker pytest
 
 A note on how the retry tests work. Under `.apply()` Celery runs the task
 eagerly, and `self.retry()` in eager mode re-executes the task inline rather
@@ -321,3 +321,65 @@ def test_reaper_leaves_healthy_jobs_alone(
     reap_stale_jobs.apply().get()
 
     assert read_job(job_id)["status"] == JobStatus.PROCESSING.value
+
+
+# --------------------------------------------------------------------------
+# jobs that were committed but never enqueued
+# --------------------------------------------------------------------------
+
+
+def _long_pending() -> datetime:
+    return _now() - timedelta(seconds=settings.ORPHANED_PENDING_SECONDS + 60)
+
+
+def test_reaper_revives_a_job_that_was_never_enqueued(
+    client, upload, force_job_state, read_job, sample_pdf_bytes
+):
+    """The API can die between committing the row and sending the task.
+
+    Nothing else rescues these: the PROCESSING sweep never sees them, because
+    no worker ever claimed them.
+    """
+    job_id = uuid.UUID(upload(sample_pdf_bytes).json()["job_id"])
+    force_job_state(job_id, created_at=_long_pending())
+    client.sent.clear()
+
+    summary = reap_stale_jobs.apply().get()
+
+    assert summary["revived_pending"] >= 1
+    job = read_job(job_id)
+    assert job["status"] == JobStatus.PENDING.value, "still queued, now actually sent"
+    assert job["retry_count"] == 1, "reviving costs a retry, bounding the loop"
+    assert (TASK_EXTRACT_TEXT, [str(job_id)], {"queue": "default"}) in client.sent
+
+
+def test_reaper_dead_letters_a_job_it_can_never_enqueue(
+    client, upload, force_job_state, read_job, sample_pdf_bytes
+):
+    job_id = uuid.UUID(upload(sample_pdf_bytes).json()["job_id"])
+    force_job_state(
+        job_id, created_at=_long_pending(), retry_count=3, max_retries=3
+    )
+    client.sent.clear()
+
+    reap_stale_jobs.apply().get()
+
+    job = read_job(job_id)
+    assert job["status"] == JobStatus.DEAD_LETTER.value
+    assert job["completed_at"] is not None
+    assert (TASK_EXTRACT_TEXT, [str(job_id)], {"queue": "default"}) not in client.sent
+
+
+def test_reaper_does_not_disturb_an_ordinary_backlog(
+    client, upload, force_job_state, read_job, sample_pdf_bytes
+):
+    """A recently queued job is waiting for a worker, not lost."""
+    job_id = uuid.UUID(upload(sample_pdf_bytes).json()["job_id"])
+    client.sent.clear()
+
+    reap_stale_jobs.apply().get()
+
+    job = read_job(job_id)
+    assert job["status"] == JobStatus.PENDING.value
+    assert job["retry_count"] == 0, "no retry burned on a healthy queued job"
+    assert (TASK_EXTRACT_TEXT, [str(job_id)], {"queue": "default"}) not in client.sent

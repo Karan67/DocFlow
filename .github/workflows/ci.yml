@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run on the same ref.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        # Same image the stack runs, so pgvector and its HNSW index behave
+        # identically here.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: docflow
+          POSTGRES_USER: docflow
+          POSTGRES_PASSWORD: docflow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docflow -d docflow"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+
+      minio:
+        # bitnami's image starts the server without a command override, which
+        # GitHub service containers cannot supply, and creates the bucket for us.
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: docflow
+          MINIO_ROOT_PASSWORD: docflowsecret
+          MINIO_DEFAULT_BUCKETS: docflow-uploads
+        ports: ["9000:9000"]
+        options: >-
+          --health-cmd "mc ready local"
+          --health-interval 5s --health-timeout 5s --health-retries 24
+
+    env:
+      DATABASE_URL: postgresql+psycopg2://docflow:docflow@localhost:5432/docflow
+      REDIS_URL: redis://localhost:6379/0
+      UPLOAD_DIR: /tmp/docflow-uploads
+      S3_BUCKET: docflow-uploads
+      S3_ENDPOINT_URL: http://localhost:9000
+      AWS_ACCESS_KEY_ID: docflow
+      AWS_SECRET_ACCESS_KEY: docflowsecret
+      AWS_REGION: us-east-1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install OCR system dependencies
+        # tesseract-ocr-eng is a separate package and is not pulled in
+        # implicitly; poppler provides the pdftoppm that pdf2image shells out to.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tesseract-ocr tesseract-ocr-eng poppler-utils
+
+      - name: Install Python dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Cache the embedding model
+        # ~130MB. Downloading it on every run would dominate the job.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-bge-small-en-v1.5
+
+      - name: Run migrations
+        run: alembic upgrade head
+
+      - name: Run tests
+        run: pytest -q
+
+  images:
+    name: Docker images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built but not pushed: this job exists to catch a broken Dockerfile
+      # before it breaks someone's `docker compose up`.
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: api
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: worker
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build dashboard image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

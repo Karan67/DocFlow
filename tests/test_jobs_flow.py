@@ -1,6 +1,6 @@
 """End-to-end Phase 1 flow against a live Postgres.
 
-Run inside the api container:  docker compose exec api pytest
+Run inside the worker container:  docker compose exec worker pytest
 
 Note: Celery's `task_always_eager` has **no effect on `app.send_task()`** - it
 only short-circuits `Task.apply_async()`. So the producer side is verified by

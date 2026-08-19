@@ -1,6 +1,6 @@
 """Phase 4: queue routing, priority resolution and rate limiting.
 
-Run inside the api container:  docker compose exec api pytest
+Run inside the worker container:  docker compose exec worker pytest
 
 Two independent axes, deliberately kept separate:
 
@@ -265,3 +265,69 @@ def test_reads_are_not_rate_limited(client, rate_limited):
     """Only the expensive endpoint is limited; polling status must stay free."""
     for _ in range(int(settings.RATE_LIMIT_UPLOAD.split("/")[0]) + 5):
         assert client.get("/jobs", params={"limit": 1}).status_code == 200
+
+
+# --------------------------------------------------------------------------
+# trusted proxies
+# --------------------------------------------------------------------------
+
+
+def _request(headers: dict[str, str] | None = None, peer: str = "10.0.0.1"):
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/jobs/upload",
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("testserver", 80),
+            "client": (peer, 1234),
+            "headers": [
+                (key.lower().encode(), value.encode())
+                for key, value in (headers or {}).items()
+            ],
+        }
+    )
+
+
+def test_forwarded_header_is_ignored_without_a_declared_proxy(monkeypatch):
+    """Default deployment has no proxy, so the header is not evidence."""
+    from api.limiter import client_ip
+
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_COUNT", 0)
+
+    assert client_ip(_request({"x-forwarded-for": "1.2.3.4"})) == "10.0.0.1"
+
+
+def test_forwarded_header_is_read_when_a_proxy_is_declared(monkeypatch):
+    from api.limiter import client_ip
+
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_COUNT", 1)
+
+    assert client_ip(_request({"x-forwarded-for": "203.0.113.7"})) == "203.0.113.7"
+
+
+def test_client_supplied_forwarded_entries_cannot_spoof_the_limit(monkeypatch):
+    """The header is appended to by each hop; the client controls the left.
+
+    Taking the leftmost entry - the common mistake - would let anyone send a
+    random X-Forwarded-For and get a fresh quota on every request.
+    """
+    from api.limiter import client_ip
+
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_COUNT", 1)
+
+    spoofed = _request({"x-forwarded-for": "1.2.3.4, 203.0.113.7"})
+
+    assert client_ip(spoofed) == "203.0.113.7", "must use what the proxy wrote"
+
+
+def test_falls_back_to_the_socket_when_the_header_is_too_short(monkeypatch):
+    """Misconfiguration should not hand out unlimited quota."""
+    from api.limiter import client_ip
+
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_COUNT", 2)
+
+    assert client_ip(_request({"x-forwarded-for": "203.0.113.7"})) == "10.0.0.1"

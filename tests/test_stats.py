@@ -1,6 +1,6 @@
 """Phase 5: the stats endpoint behind the dashboard.
 
-Run inside the api container:  docker compose exec api pytest
+Run inside the worker container:  docker compose exec worker pytest
 
 The dashboard polls this every two seconds, so two things matter beyond
 correctness: it must stay cheap, and its shape must be stable. Zero-filling

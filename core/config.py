@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -18,10 +19,25 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql+psycopg2://docflow:docflow@localhost:5433/docflow"
     REDIS_URL: str = "redis://localhost:6380/0"
 
+    # --- storage ---
+    #: "local" (a shared Docker volume) or "s3". The rest of the codebase only
+    #: ever handles an opaque key, so switching needs no migration.
+    STORAGE_BACKEND: Literal["local", "s3"] = "local"
+
     # Compose overrides this with /data/uploads (the shared volume); the
     # relative default is for running the app directly on the host.
     UPLOAD_DIR: Path = Path("uploads")
     MAX_UPLOAD_BYTES: int = 25_000_000
+
+    S3_BUCKET: str = "docflow-uploads"
+    S3_PREFIX: str = "uploads/"
+    #: Set for an S3-compatible endpoint such as MinIO. Leave unset for real
+    #: AWS, where boto3 resolves the endpoint from the region.
+    S3_ENDPOINT_URL: str | None = None
+    AWS_REGION: str = "us-east-1"
+    # Credentials deliberately absent: boto3 resolves them from environment
+    # variables in development and an instance role in production. Putting
+    # access keys in application config is how they end up in git.
 
     # Extracted text is stored in a JSONB column; cap it so one giant PDF
     # cannot bloat the jobs table.
@@ -49,6 +65,11 @@ class Settings(BaseSettings):
     STALE_JOB_SECONDS: int = 900
     #: How often the reaper sweeps for orphaned jobs.
     REAPER_INTERVAL_SECONDS: int = 300
+
+    #: A job still PENDING this long after creation was probably never enqueued
+    #: - the API committed the row and then died before `send_task`. Set well
+    #: above STALE_JOB_SECONDS so an ordinary backlog is never touched.
+    ORPHANED_PENDING_SECONDS: int = 1800
 
     # --- Phase 3: processing pipeline ---
     #: A PDF whose text layer yields fewer than this many characters per page
@@ -83,6 +104,13 @@ class Settings(BaseSettings):
     #: Requests per window, per client IP, on the upload endpoint.
     RATE_LIMIT_UPLOAD: str = "30/minute"
     RATE_LIMIT_ENABLED: bool = True
+
+    #: How many trusted reverse proxies sit in front of the API. 0 means the
+    #: socket address is the client. Anything above 0 reads that many entries
+    #: back from the right of X-Forwarded-For - a header the client controls,
+    #: so trusting it without knowing the hop count lets anyone spoof their IP
+    #: and bypass the rate limit entirely.
+    TRUSTED_PROXY_COUNT: int = 0
 
     LOG_LEVEL: str = "INFO"
     CORS_ORIGINS: list[str] = ["http://localhost:3001", "http://127.0.0.1:3001"]
