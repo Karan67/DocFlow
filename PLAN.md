@@ -107,18 +107,36 @@ Two findings worth keeping:
   the 40 threshold — so they were correctly classified as scans. The threshold
   was right; the fixtures were unrealistic. They now build realistic pages.
 
-## Phase 4 — Scale ⬅ next
+## Phase 4 — Scale ✅ done
 
-- **Separate queues (`high` / `default` / `low`) routed with `-Q`, not Redis
-  priority values.** Celery's numeric priority over Redis is implemented as
-  multiple queue keys and is genuinely quirky; dedicated queues are what
-  production systems do and are far easier to defend in an interview.
-  `task_default_queue` is already set, so this is additive.
-- `worker_prefetch_multiplier=1` — already set. Without it one worker
-  greedily prefetches a batch of long tasks while another sits idle.
-- Rate limit the upload endpoint (`slowapi`, Redis-backed)
+- ✅ **Named queues (`high` / `default` / `low`) routed with `-Q`**, plus
+  `queue_order_strategy: "priority"` so they drain in strict order rather than
+  round-robin. Both settings are needed; `-Q` alone means nothing.
+- ✅ A **separate `ocr` queue and worker pool** — this was not in the original
+  plan and turned out to be the more important half. Urgency and workload
+  class are different axes: an urgent scan is still urgent, it just must not
+  run on a pool that fast work depends on.
+- ✅ Concurrency per pool: 4 for fast stages, 1 for OCR (tesseract is CPU-bound
+  and already multi-threaded, so stacking it just slows every scan).
+- ✅ `priority` column, an optional upload field, and size-based auto-demotion
+  so one large scan does not make a queue of small documents wait.
+- ✅ Redis-backed rate limiting on upload only — in-process limiting would be
+  per replica, and limiting status polling would break the core interaction.
+- ✅ A migration-retry entrypoint, after Postgres recovery mode caused a
+  startup race that left the workers unstarted.
 
-## Phase 5 — Observability & UI
+Schema (migration `0004`): `priority`, its CHECK constraint, and a
+`(priority, status)` index.
+
+**Done when:** an urgent job overtakes a queued backlog, and a slow scan cannot
+block fast work. ✅ Verified: 67 tests green, plus a live demonstration — five
+low-priority jobs were enqueued *first* and one high-priority job *last*, and
+the high one was processed **first**. Separately, a scanned document's OCR
+stage ran entirely on the dedicated pool (`queued ocr on ocr`) and handed back
+to the fast pool on `high`, and the rate limiter allowed exactly 30 requests
+before returning 429.
+
+## Phase 5 — Observability & UI ⬅ next
 
 Flower has been running since Phase 0, so this is the Next.js dashboard on
 `GET /jobs`: upload form, live status table, retry counts. CORS is already
@@ -154,3 +172,5 @@ Flower cover everything until there is something worth showing.
 | "embedding generation as a second job type" | one job row that advances through stages | The question people ask is "is my document ready?", not "did stage two finish?". A row per step needs a second grouping concept immediately |
 | Celery `chain()` | explicit stage dispatch | Whether OCR runs depends on what extraction finds; a static chain cannot branch on a result |
 | OCR as a fallback inside `extract_text` | OCR as its own stage | Reading a text layer is microseconds, OCR is seconds per page. One name for both makes queue behaviour unpredictable |
+| priority queues only | priority queues **plus** a dedicated `ocr` queue and pool | Priority reorders a queue; it does not stop a 60s task blocking a 2ms one. Only a separate pool does that |
+| "small files processed before large ones" | large files auto-demoted to `low` | Same intent, expressed as a default rather than a sort: the queue does the ordering, and an explicit priority can still override it |

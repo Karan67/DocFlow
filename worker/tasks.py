@@ -57,6 +57,7 @@ from worker.celery_app import (
     TASK_OCR,
     TASK_REAP_STALE_JOBS,
     celery_app,
+    queue_for,
 )
 from worker.embed import embed_document, get_model
 from worker.extract import ExtractionError, extract_text_from_pdf
@@ -375,6 +376,7 @@ def _complete_stage(
 ) -> dict[str, Any]:
     """Record a finished stage and either advance the pipeline or finish it."""
     next_task: str | None = None
+    next_queue: str = ""
 
     with session_scope() as session:
         job = session.get(Job, job_uuid, with_for_update=True)
@@ -407,22 +409,25 @@ def _complete_stage(
             job.started_at = None
             next_task = STAGE_TASKS[outcome.next_stage.value]
             next_stage_value = outcome.next_stage.value
+            next_queue = queue_for(next_stage_value, job.priority)
 
     # Commit first, enqueue second - same rule as the upload route.
     if next_task is not None:
-        celery_app.send_task(next_task, args=[str(job_uuid)], queue="default")
+        celery_app.send_task(next_task, args=[str(job_uuid)], queue=next_queue)
         logger.info(
-            "Job %s finished %s in %sms -> queued %s",
+            "Job %s finished %s in %sms -> queued %s on %s",
             job_uuid,
             stage.value,
             duration_ms,
             next_stage_value,
+            next_queue,
         )
         return _outcome(
             job_uuid,
             JobStatus.PENDING.value,
             stage=stage.value,
             next_stage=next_stage_value,
+            queue=next_queue,
             duration_ms=duration_ms,
         )
 
@@ -639,7 +644,7 @@ def reap_stale_jobs() -> dict[str, Any]:
     forever with nothing left to move them.
     """
     cutoff = _now() - timedelta(seconds=settings.STALE_JOB_SECONDS)
-    requeue: list[tuple[uuid.UUID, str]] = []
+    requeue: list[tuple[uuid.UUID, str, str]] = []
     dead_lettered = 0
 
     with session_scope() as session:
@@ -676,12 +681,15 @@ def reap_stale_jobs() -> dict[str, Any]:
                 f"Reclaimed by the reaper after {age:.0f}s in PROCESSING "
                 f"at stage {job.stage}"
             )
-            # Requeue the stage the job is actually on, not the entry point.
-            requeue.append((job.id, STAGE_TASKS[job.stage]))
+            # Requeue the stage the job is actually on, not the entry point,
+            # and onto the queue that stage belongs on.
+            requeue.append(
+                (job.id, STAGE_TASKS[job.stage], queue_for(job.stage, job.priority))
+            )
 
     # Same rule as the upload route: commit first, enqueue second.
-    for job_id, task_name in requeue:
-        celery_app.send_task(task_name, args=[str(job_id)], queue="default")
+    for job_id, task_name, queue_name in requeue:
+        celery_app.send_task(task_name, args=[str(job_id)], queue=queue_name)
 
     if requeue or dead_lettered:
         logger.warning(

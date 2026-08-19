@@ -10,6 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from api.limiter import limiter
 from api.routes import router as jobs_router
 from api.schemas import HealthResponse
 from core.config import configure_logging, settings
@@ -26,6 +30,11 @@ app = FastAPI(
         "reports job status; Celery workers do the actual processing."
     ),
 )
+
+# slowapi reads the limiter off app.state and needs a handler for its own
+# exception type, otherwise a tripped limit surfaces as a 500.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,

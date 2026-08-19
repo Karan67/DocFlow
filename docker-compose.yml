@@ -59,9 +59,7 @@ services:
   api:
     <<: *app
     container_name: docflow_api
-    command: >
-      sh -c "alembic upgrade head &&
-             uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload"
+    command: ["sh", "/app/scripts/start-api.sh", "--reload"]
     ports:
       - "${API_PORT:-8001}:8000"
     depends_on:
@@ -81,10 +79,31 @@ services:
     container_name: docflow_worker
     # init gives PID 1 proper signal handling so Celery gets a warm shutdown.
     init: true
-    command: celery -A worker.celery_app worker --loglevel=INFO --concurrency=2 -Q default -E
+    # Drains the priority queues in strict order (queue_order_strategy), so
+    # `high` is emptied before `default` is touched. Notably NOT subscribed to
+    # `ocr`: a 60s scan must never sit in front of a 2ms extraction.
+    command: >
+      celery -A worker.celery_app worker --loglevel=INFO
+      --concurrency=${WORKER_CONCURRENCY:-4} -Q high,default,low -E
+      --hostname=fast@%h
     depends_on:
       # Gating on the API being healthy also guarantees migrations have run,
       # since the API only serves after `alembic upgrade head` succeeds.
+      api:
+        condition: service_healthy
+
+  worker-ocr:
+    <<: *app
+    container_name: docflow_worker_ocr
+    init: true
+    # A dedicated pool for the one genuinely slow stage. Concurrency 1 because
+    # tesseract is CPU-bound and already multi-threaded internally - stacking
+    # them just makes every scan slower.
+    command: >
+      celery -A worker.celery_app worker --loglevel=INFO
+      --concurrency=${OCR_CONCURRENCY:-1} -Q ocr -E
+      --hostname=ocr@%h
+    depends_on:
       api:
         condition: service_healthy
 

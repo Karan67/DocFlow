@@ -4,9 +4,10 @@ Upload a document, get a job id back immediately, poll for the result. The API
 never does the slow work — Celery workers do, in separate processes that can
 crash and restart without taking the API down.
 
-**Status: Phase 3 complete.** A three-stage ingestion pipeline - text
+**Status: Phase 4 complete.** A three-stage ingestion pipeline - text
 extraction, OCR fallback for scans, and embeddings into pgvector - with
-retries, dead-lettering and idempotency. See [PLAN.md](PLAN.md) for the roadmap.
+retries, dead-lettering, idempotency, priority queues and rate limiting.
+See [PLAN.md](PLAN.md) for the roadmap.
 
 ```
 POST /jobs/upload ──> FastAPI ──> Postgres (job row, PENDING)
@@ -38,8 +39,18 @@ the same retry and dead-letter machinery.
 docker compose up -d --build
 ```
 
-Six containers come up: `postgres`, `redis`, `api`, `worker`, `beat`, `flower`.
-Migrations run automatically before the API starts serving.
+Seven containers come up: `postgres`, `redis`, `api`, `worker`, `worker-ocr`,
+`beat`, `flower`. Migrations run automatically before the API starts serving.
+
+Two worker pools, on purpose:
+
+| Pool | Queues | Concurrency | Why |
+|---|---|---|---|
+| `worker` | `high`, `default`, `low` | 4 | The fast stages. Drains in strict order, so `high` empties before `default` is touched |
+| `worker-ocr` | `ocr` | 1 | OCR only. Tesseract is CPU-bound and already multi-threaded, so stacking it just makes every scan slower |
+
+A 60-second scan can never sit in front of a 2ms text extraction, because the
+two never share a queue.
 
 | Service | URL | Note |
 |---|---|---|
@@ -52,6 +63,9 @@ Migrations run automatically before the API starts serving.
 
 `beat` has no port — it is the scheduler that fires the stale-job reaper. Run
 exactly one of it; two would double-fire every scheduled task.
+
+Concurrency is tunable without editing compose: `WORKER_CONCURRENCY` and
+`OCR_CONCURRENCY`.
 
 Host ports are deliberately non-default (5433/6380/8001) so this stack can run
 alongside other local projects. Override them in a `.env` file — see
@@ -90,6 +104,15 @@ and uploads over `MAX_UPLOAD_BYTES` (`413`).
 Uploading a file whose content is already in the pipeline returns **`200` with
 `deduplicated: true`** and the original `job_id`, rather than `202`. Nothing new
 was accepted, so it is not a "created" response.
+
+`POST /jobs/upload` accepts an optional `priority` form field (`high`, `normal`
+or `low`). Left unset, uploads over `LARGE_FILE_BYTES` default to `low` — one
+40MB scan should not make a queue of one-page invoices wait. An explicit
+priority always wins.
+
+The endpoint is rate limited to `RATE_LIMIT_UPLOAD` (default 30/minute) per
+client IP, returning `429`. Reads are not limited — polling job status has to
+stay free, or the API stops answering the one question it exists to answer.
 
 ### Job statuses
 
@@ -270,6 +293,40 @@ cold start into the first real job, which defeats the point of a warm pool.
 The model is also baked into the image, so startup is a disk read rather than a
 download.
 
+### Scale (Phase 4)
+
+**Named queues, not Celery's numeric priorities.** Celery's numeric priority
+over Redis is implemented as several queue keys under the hood, with fiddly
+semantics. Naming the queues makes the routing explicit and — the part that
+actually matters — lets a worker pool subscribe to a *subset* of them.
+
+**Urgency and workload class are separate axes.** `high`/`default`/`low` is
+urgency; `ocr` is workload class. Collapsing them ("OCR is low priority") would
+be wrong: an urgent scan is still urgent, it just must not run on a pool that
+fast work depends on.
+
+**Strict ordering needs two settings, not one.** `-Q high,default,low` alone
+round-robins between queues, so "priority" would mean nothing;
+`queue_order_strategy: "priority"` makes the worker drain them in the order
+given. And it only holds with `worker_prefetch_multiplier=1` — a worker holding
+a prefetched batch of low-priority work would chew through it before looking at
+`high` again.
+
+**OCR ignores priority, deliberately.** With one OCR worker, jumping the queue
+only reorders a backlog that is CPU-saturated either way. Priority sub-queues
+for OCR would be three more queues buying almost nothing.
+
+**Large uploads self-demote.** Over `LARGE_FILE_BYTES` and with no explicit
+priority, a job lands on `low`. The common case is many small documents, and
+one large one should not make them wait.
+
+**The rate limiter is Redis-backed, not in-process.** In-memory limiting is a
+property of one replica, so four API containers would let through four times
+the configured rate.
+
+**Only the write endpoint is limited.** Rate-limiting status polling would
+break the core interaction: clients are *told* to poll.
+
 ---
 
 ## Tests
@@ -278,7 +335,8 @@ download.
 docker compose exec api pytest -v
 ```
 
-47 tests: extraction, OCR-routing and chunking unit tests (no DB or broker),
+67 tests: extraction, OCR-routing, chunking and queue-routing unit tests (no
+DB or broker),
 the full upload → DONE flow, Phase 2's reliability behaviour — retry-then-succeed,
 dead-lettering, permanent failures skipping retries, backoff growth and jitter,
 deduplication, reclaiming orphaned work, the reaper — and Phase 3's pipeline:
@@ -286,10 +344,18 @@ digital PDFs skipping OCR, scans routed through it, real embeddings landing in
 pgvector at the schema dimension, re-runnable stages, cascade deletes, and a
 mid-pipeline failure being attributed to the stage that caused it.
 
-Two of them do real work rather than mocking it: one runs tesseract over a
+Phase 4 adds queue routing per stage and priority, the reaper requeueing onto
+the right queue, priority resolution, and the rate limiter actually returning
+429 at the configured threshold.
+
+Two tests do real work rather than mocking it: one runs tesseract over a
 genuinely rasterised PDF, and one embeds with the real model. Both are worth
 the couple of seconds — a mocked OCR test proves nothing about whether
 tesseract is actually installed in the image.
+
+One subtlety if you add tests: the limiter is Redis-backed and its window
+outlives a single test, so the `client` fixture disables it. Tests that
+exercise limiting turn it back on and clear the window either side.
 
 Two Celery details that shape how these are written:
 
@@ -329,6 +395,22 @@ only comes into play if the retry budget is raised.
 
 **Scheduled tasks fire twice** — more than one `beat` container is running.
 
+**Scans queue up but never run** — `worker-ocr` is down. Nothing else
+subscribes to `ocr`, which is the point, so that queue simply grows.
+
+**Everything is stuck behind one slow job** — a worker is subscribed to queues
+it should not be. `worker` must not include `ocr` in its `-Q` list.
+
+**`high` priority makes no difference** — check `queue_order_strategy` is
+`priority` in `broker_transport_options`, and that
+`worker_prefetch_multiplier` is 1. Either one missing silently degrades
+priority to round-robin.
+
+**429s during local testing** — the limit is per IP per minute and its window
+lives in Redis. Inspect with
+`docker compose exec redis redis-cli --scan --pattern 'LIMITS:*'`, or wait out
+the minute.
+
 **A text PDF got sent to OCR** — its text layer averages under
 `OCR_MIN_CHARS_PER_PAGE` (40) characters per page. Sparse documents (a title
 page, a mostly-blank form) can trip this. The result is still correct, just
@@ -352,7 +434,6 @@ That is fine on localhost; it must not be set on a public deployment.
 
 ## Next
 
-Phase 4 is scale: separate `high`/`default`/`low` queues routed with `-Q`,
-concurrency limits, and rate limiting on the upload endpoint. Now that OCR
-exists, the queue-separation argument has teeth — a 60-second scan and a 2ms
-extraction should not sit behind one another. [PLAN.md](PLAN.md) has the detail.
+Phase 5 is observability: Flower has been running since Phase 0, so this is the
+Next.js dashboard on `GET /jobs` — upload form, live status table, stage
+timeline, retry counts and queue depths. [PLAN.md](PLAN.md) has the detail.
