@@ -4,24 +4,31 @@ Upload a document, get a job id back immediately, poll for the result. The API
 never does the slow work — Celery workers do, in separate processes that can
 crash and restart without taking the API down.
 
-**Status: Phase 2 complete.** One job type (`extract_text`), end-to-end, with
+**Status: Phase 3 complete.** A three-stage ingestion pipeline - text
+extraction, OCR fallback for scans, and embeddings into pgvector - with
 retries, dead-lettering and idempotency. See [PLAN.md](PLAN.md) for the roadmap.
 
 ```
 POST /jobs/upload ──> FastAPI ──> Postgres (job row, PENDING)
                          │
-                         └──────> Redis queue
-                                     │
-                                     ▼
-                              Celery worker ──> PROCESSING ──> DONE
-                                     │             │  ▲          │
-                                     │             │  └─ RETRYING┤ (backoff)
-                                     │             │             │
-                                     │             └─> FAILED    │ (bad input)
-                                     │                 DEAD_LETTER (out of retries)
-                                     ▼                           │
-GET /jobs/{id} <── FastAPI <── Postgres <─────────────────────────┘
+                         └──────> Redis queue ──> Celery workers
+                                                       │
+        ┌──────────────────────────────────────────────┘
+        ▼
+   extract_text ──(text layer found)──────────> embed ──> DONE
+        │                                         ▲
+        └──(scanned: no text layer)──> ocr ───────┘
+
+   any stage ──> RETRYING (backoff) ──> back to the same stage
+             ──> FAILED       (bad input, no retry)
+             ──> DEAD_LETTER  (retries exhausted)
+
+GET /jobs/{id} <── FastAPI <── Postgres
 ```
+
+A job is the whole pipeline, not one step: a single row advances through the
+stages, so "is my document ready?" stays one lookup while every stage reuses
+the same retry and dead-letter machinery.
 
 ---
 
@@ -99,6 +106,28 @@ was accepted, so it is not a "created" response.
 going to work" and "we kept trying and gave up" need different responses, and
 mixing them makes the failure list useless.
 
+### Pipeline stages
+
+`stage` names the step currently running (or the one that failed):
+`extract_text` -> `ocr` (scans only) -> `embed`.
+
+`stages` on the detail endpoint is the timeline - what ran, how long it took,
+how many attempts it needed, and what it produced:
+
+```json
+[
+  {"stage": "extract_text", "status": "DONE", "duration_ms": 2,
+   "detail": {"decision": "no usable text layer -> ocr", "attempts": 1}},
+  {"stage": "ocr",   "status": "DONE", "duration_ms": 784, "detail": {"attempts": 1}},
+  {"stage": "embed", "status": "DONE", "duration_ms": 248, "detail": {"attempts": 1}}
+]
+```
+
+That is how a mid-pipeline failure stays legible: the job status says it
+failed, `stages` says which step failed and what the earlier ones produced.
+Note `started_at` is when the **current stage** started, not the pipeline -
+the reaper needs it that way. The timeline is in `stages`.
+
 ---
 
 ## Layout
@@ -106,7 +135,7 @@ mixing them makes the failure list useless.
 ```
 core/       config, database session, models + state machine, storage      <- shared
 api/        FastAPI app, routes, schemas                                   <- producer
-worker/     celery_app, tasks, extract                                     <- consumer
+worker/     celery_app, tasks (stage runner), extract, ocr, embed          <- consumer
 alembic/    migrations
 tests/      unit (extract) + integration (full flow)
 ```
@@ -195,6 +224,52 @@ overlapping sweeps from fighting over the same row.
 concurrency slot forever. `STALE_JOB_SECONDS` sits well above the hard limit so
 the reaper never steals a job that is legitimately still running.
 
+### Pipeline (Phase 3)
+
+**A job is a pipeline, not a step.** One row advances through the stages rather
+than spawning a row per step. The spec suggested a job per step; that would
+have needed a second "which document is this?" concept immediately, because the
+question people actually ask is "is my document ready?", not "did stage two
+finish?". One row keeps that a single lookup and lets every stage reuse the
+Phase 2 retry machinery untouched.
+
+**Stages dispatch explicitly instead of using Celery `chain()`.** The route
+through the pipeline is not known up front - whether OCR runs depends on what
+extraction finds - and a static chain cannot branch on a result. Explicit
+dispatch also keeps the commit-then-enqueue rule intact at every hop, and means
+a retrying stage does not have to reason about the rest of a chain's state.
+
+**OCR is its own stage, not a fallback inside extraction.** Reading a text
+layer is microseconds; OCR is ~1s per page and can be minutes for a long scan.
+Mixing a 2ms task and a 60s task under one name makes queue behaviour
+unpredictable and would make the Phase 4 priority work considerably harder.
+
+**The OCR decision is per page, not absolute.** `needs_ocr` compares characters
+*per page* against a threshold. An absolute threshold passes a 50-page scan
+that happens to carry 200 characters of embedded logo text, and fails a
+legitimate one-page memo.
+
+**Each stage gets its own retry budget.** `retry_count` resets when the
+pipeline advances, so a rocky extraction does not leave the embedding step with
+nothing left. The attempt count is written into the `stages` log, so resetting
+the counter does not erase the evidence.
+
+**Re-running the embed stage deletes its chunks first.** `acks_late` can
+redeliver a finished stage, so a re-run must replace its rows rather than
+collide with the `(job_id, chunk_index)` unique constraint. Chunks also cascade
+on job delete, so nothing leaves orphaned vectors behind.
+
+**OCR has its own, much longer time limits.** The global limits are sized for
+the fast stages; a long scan would be killed mid-page under them.
+`STALE_JOB_SECONDS` still sits above `OCR_HARD_TIME_LIMIT` so the reaper cannot
+steal a scan that is legitimately still running.
+
+**The embedding model is preloaded when a worker child starts**, via
+`worker_process_init`. Loading it lazily put a ~20s (worse under contention)
+cold start into the first real job, which defeats the point of a warm pool.
+The model is also baked into the image, so startup is a disk read rather than a
+download.
+
 ---
 
 ## Tests
@@ -203,10 +278,18 @@ the reaper never steals a job that is legitimately still running.
 docker compose exec api pytest -v
 ```
 
-27 tests: extraction unit tests (no DB or broker), the full upload → DONE flow,
-and Phase 2's reliability behaviour — retry-then-succeed, dead-lettering after
-the budget is spent, permanent failures skipping retries entirely, backoff
-growth and jitter, deduplication, reclaiming orphaned work, and the reaper.
+47 tests: extraction, OCR-routing and chunking unit tests (no DB or broker),
+the full upload → DONE flow, Phase 2's reliability behaviour — retry-then-succeed,
+dead-lettering, permanent failures skipping retries, backoff growth and jitter,
+deduplication, reclaiming orphaned work, the reaper — and Phase 3's pipeline:
+digital PDFs skipping OCR, scans routed through it, real embeddings landing in
+pgvector at the schema dimension, re-runnable stages, cascade deletes, and a
+mid-pipeline failure being attributed to the stage that caused it.
+
+Two of them do real work rather than mocking it: one runs tesseract over a
+genuinely rasterised PDF, and one embeds with the real model. Both are worth
+the couple of seconds — a mocked OCR test proves nothing about whether
+tesseract is actually installed in the image.
 
 Two Celery details that shape how these are written:
 
@@ -246,6 +329,19 @@ only comes into play if the retry budget is raised.
 
 **Scheduled tasks fire twice** — more than one `beat` container is running.
 
+**A text PDF got sent to OCR** — its text layer averages under
+`OCR_MIN_CHARS_PER_PAGE` (40) characters per page. Sparse documents (a title
+page, a mostly-blank form) can trip this. The result is still correct, just
+slower.
+
+**`Tesseract is not installed`** — the image was built before Phase 3.
+`docker compose build --no-cache` and bring it back up.
+
+**The embed stage reports a dimension mismatch** — `EMBEDDING_MODEL` and
+`EMBEDDING_DIM` disagree, or the model changed without a migration. The
+`vector(N)` column dimension is fixed at migration time; changing models means
+a new migration and re-embedding.
+
 **Running Celery natively on Windows** — the prefork pool does not work; use
 `--pool=solo`. Inside Docker (Linux) this is a non-issue.
 
@@ -256,6 +352,7 @@ That is fine on localhost; it must not be set on a public deployment.
 
 ## Next
 
-Phase 3 is real processing: OCR via `pytesseract` for scanned PDFs, an
-embedding job type, and chaining the two with Celery `chain()`.
-[PLAN.md](PLAN.md) has the detail.
+Phase 4 is scale: separate `high`/`default`/`low` queues routed with `-Q`,
+concurrency limits, and rate limiting on the upload endpoint. Now that OCR
+exists, the queue-separation argument has teeth — a 60-second scan and a 2ms
+extraction should not sit behind one another. [PLAN.md](PLAN.md) has the detail.

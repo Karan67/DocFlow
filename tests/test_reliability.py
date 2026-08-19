@@ -47,11 +47,14 @@ def failing_extractor(monkeypatch):
             state["calls"] += 1
             if state["calls"] <= failures:
                 raise error
+            # Dense enough to stay above OCR_MIN_CHARS_PER_PAGE, so these
+            # tests exercise the retry path rather than the OCR routing path.
+            text = "Recovered document text. " * 20
             return {
                 "page_count": 1,
-                "char_count": 5,
+                "char_count": len(text),
                 "truncated": False,
-                "text": "hello",
+                "text": text,
             }
 
         monkeypatch.setattr(tasks_module, "extract_text_from_pdf", fake_extract)
@@ -74,10 +77,15 @@ def test_transient_failure_retries_then_succeeds(
     extract_text_task.apply(args=[str(job_id)])
 
     job = read_job(job_id)
-    assert job["status"] == JobStatus.DONE.value
     assert state["calls"] == 3, "two failures then one success"
-    assert job["retry_count"] == 2
-    # A recovered job carries no error and no pending retry.
+    # The stage succeeded, so the pipeline advanced rather than finishing.
+    assert job["status"] == JobStatus.PENDING.value
+    assert job["stage"] == "embed"
+    # Each stage gets a fresh budget, so retry_count resets on advance - the
+    # attempt count survives in the stage log instead.
+    assert job["retry_count"] == 0
+    assert job["stages"][0]["detail"]["attempts"] == 3
+    # A recovered stage carries no error and no pending retry.
     assert job["error_message"] is None
     assert job["next_retry_at"] is None
 
@@ -214,8 +222,11 @@ def test_stale_processing_job_is_reclaimed(
     extract_text_task.apply(args=[str(job_id)])
 
     job = read_job(job_id)
-    assert job["status"] == JobStatus.DONE.value
-    assert job["retry_count"] == 1, "the reclaim costs a retry, bounding redelivery"
+    assert job["status"] == JobStatus.PENDING.value
+    assert job["stage"] == "embed", "the reclaimed stage completed and advanced"
+    assert job["stages"][0]["detail"]["attempts"] == 2, (
+        "the reclaim costs a retry, bounding redelivery"
+    )
 
 
 def test_in_flight_job_is_not_stolen(

@@ -23,7 +23,9 @@ from worker.tasks import extract_text_task
 pytestmark = pytest.mark.integration
 
 
-def test_upload_creates_pending_job_and_enqueues(client, upload, read_job, sample_pdf_bytes):
+def test_upload_creates_pending_job_and_enqueues(
+    client, upload, read_job, sample_pdf_bytes
+):
     response = upload(sample_pdf_bytes)
 
     assert response.status_code == 202
@@ -36,16 +38,19 @@ def test_upload_creates_pending_job_and_enqueues(client, upload, read_job, sampl
     # The row exists and is committed *before* the enqueue happens.
     job = read_job(job_id)
     assert job["status"] == JobStatus.PENDING.value
+    assert job["stage"] == "extract_text", "pipelines always start at extraction"
+    assert job["stages"] == []
     assert job["started_at"] is None
 
     assert client.sent == [(TASK_EXTRACT_TEXT, [str(job_id)], {"queue": "default"})]
 
 
-def test_worker_completes_the_job(client, upload, sample_pdf_bytes):
+def test_worker_completes_the_job(
+    client, upload, run_pipeline, fake_embedder, sample_pdf_bytes
+):
     job_id = uuid.UUID(upload(sample_pdf_bytes).json()["job_id"])
 
-    outcome = extract_text_task.apply(args=[str(job_id)]).get()
-    assert outcome["status"] == JobStatus.DONE.value
+    run_pipeline(job_id)
 
     detail = client.get(f"/jobs/{job_id}").json()
     assert detail["status"] == JobStatus.DONE.value
@@ -54,13 +59,16 @@ def test_worker_completes_the_job(client, upload, sample_pdf_bytes):
     assert detail["error_message"] is None
     assert detail["result"]["page_count"] == 2
     assert PAGE_ONE in detail["result"]["text"]
+    assert [entry["stage"] for entry in detail["stages"]] == ["extract_text", "embed"]
 
 
-def test_second_delivery_is_ignored(upload, sample_pdf_bytes):
+def test_second_delivery_is_ignored(
+    upload, run_pipeline, fake_embedder, sample_pdf_bytes
+):
     """Re-delivery must not reprocess a settled job - required by acks_late."""
     job_id = uuid.UUID(upload(sample_pdf_bytes).json()["job_id"])
 
-    extract_text_task.apply(args=[str(job_id)]).get()
+    run_pipeline(job_id)
     second = extract_text_task.apply(args=[str(job_id)]).get()
 
     assert second["reason"] == "already_handled"

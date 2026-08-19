@@ -14,6 +14,8 @@ from core.config import settings
 
 #: Task names. The single shared vocabulary between producer and consumer.
 TASK_EXTRACT_TEXT = "docflow.extract_text"
+TASK_OCR = "docflow.ocr"
+TASK_EMBED = "docflow.embed"
 TASK_REAP_STALE_JOBS = "docflow.reap_stale_jobs"
 
 celery_app = Celery(

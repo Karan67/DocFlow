@@ -15,5 +15,12 @@ celery[redis]>=5.4.0
 redis>=5.2.0
 flower>=2.0.1
 
-# --- Processing (Phase 1: PDF text extraction only) ---
+# --- Processing ---
 pypdf>=5.1.0
+# OCR for scanned PDFs with no text layer
+pytesseract>=0.3.13
+pdf2image>=1.17.0
+pillow>=11.0.0
+# Embeddings. fastembed runs ONNX on CPU - no torch, so the image stays small.
+fastembed>=0.4.0
+pgvector>=0.3.6
