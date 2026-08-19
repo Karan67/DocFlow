@@ -12,6 +12,7 @@ from pdf2image import convert_from_bytes
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
 
+from api.limiter import limiter
 from api.main import app
 from core.database import session_scope
 from core.models import TERMINAL_STATUSES, DocumentChunk, Job
@@ -56,6 +57,20 @@ def sample_pdf_bytes() -> bytes:
 
 
 @pytest.fixture
+def unique_pdf():
+    """Build a PDF whose bytes are unique, so it cannot dedupe onto another test.
+
+    Deduplication is keyed on the content hash, so two tests uploading
+    identical bytes would share a job and quietly assert about each other.
+    """
+
+    def _make(label: str = "doc") -> bytes:
+        return _build_pdf(f"{label} {uuid.uuid4()}", PAGE_TWO)
+
+    return _make
+
+
+@pytest.fixture
 def other_pdf_bytes() -> bytes:
     """A different PDF, so it hashes to a different idempotency key."""
     return _build_pdf(OTHER_PAGE)
@@ -88,6 +103,10 @@ def client(monkeypatch):
         return SimpleNamespace(id=str(uuid.uuid4()))
 
     monkeypatch.setattr(celery_app, "send_task", fake_send_task)
+    # The limiter is Redis-backed and its window outlives a single test, so a
+    # suite that trips it would fail every later test. Tests that care about
+    # rate limiting turn it back on and clear the window themselves.
+    monkeypatch.setattr(limiter, "enabled", False)
     with TestClient(app) as test_client:
         test_client.sent = sent  # type: ignore[attr-defined]
         yield test_client
@@ -203,6 +222,7 @@ def read_job():
             return {
                 "status": job.status,
                 "stage": job.stage,
+                "priority": job.priority,
                 "stages": list(job.stages or []),
                 "retry_count": job.retry_count,
                 "max_retries": job.max_retries,

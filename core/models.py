@@ -51,6 +51,20 @@ class JobType(str, Enum):
     DOCUMENT = "document"
 
 
+class JobPriority(str, Enum):
+    """How urgently a job should be picked up.
+
+    Maps to a dedicated Celery queue rather than a numeric priority value.
+    Celery's numeric priorities over Redis are implemented as multiple queue
+    keys anyway, with fiddly semantics; naming the queues makes the routing
+    explicit and lets workers be dedicated to a subset of them.
+    """
+
+    HIGH = "high"
+    NORMAL = "normal"
+    LOW = "low"
+
+
 class JobStage(str, Enum):
     """Steps a document job walks through.
 
@@ -122,6 +136,9 @@ class Job(Base):
         CheckConstraint(
             "stage IN ('extract_text', 'ocr', 'embed')", name="ck_jobs_stage"
         ),
+        CheckConstraint(
+            "priority IN ('high', 'normal', 'low')", name="ck_jobs_priority"
+        ),
         Index("ix_jobs_created_at", text("created_at DESC")),
         Index("ix_jobs_status", "status"),
     )
@@ -166,6 +183,13 @@ class Job(Base):
         nullable=False,
         default=JobStage.EXTRACT_TEXT.value,
         server_default=text("'extract_text'"),
+    )
+    #: Selects which queue the job's stages are routed to.
+    priority: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default=JobPriority.NORMAL.value,
+        server_default=text("'normal'"),
     )
     #: Append-only record of every stage the job has completed: status,
     #: duration and a per-stage detail blob. This is what makes a mid-pipeline

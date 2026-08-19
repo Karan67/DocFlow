@@ -74,6 +74,16 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 150
     EMBEDDING_BATCH_SIZE: int = 32
 
+    # --- Phase 4: scale ---
+    #: Uploads above this size default to the low-priority queue so one large
+    #: document cannot make a queue of small ones wait. An explicit priority on
+    #: the request always wins.
+    LARGE_FILE_BYTES: int = 5_000_000
+
+    #: Requests per window, per client IP, on the upload endpoint.
+    RATE_LIMIT_UPLOAD: str = "30/minute"
+    RATE_LIMIT_ENABLED: bool = True
+
     LOG_LEVEL: str = "INFO"
     CORS_ORIGINS: list[str] = ["http://localhost:3001", "http://127.0.0.1:3001"]
 

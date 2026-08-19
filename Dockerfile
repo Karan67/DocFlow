@@ -23,16 +23,21 @@ RUN apt-get update \
       poppler-utils \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt requirements-dev.txt ./
-RUN pip install --no-cache-dir -r requirements-dev.txt
-
 RUN useradd --create-home --uid 1000 appuser
 
-# Bake the embedding model into the image. Downloading it lazily on the first
-# task would make that job slow and put a network dependency in the hot path.
+# fastembed and the model get their own early layers, ahead of the rest of the
+# requirements. Adding or bumping a dependency then rebuilds pip only - it does
+# not re-download the ~130MB model.
+#
+# Baking the model in at all is deliberate: fetching it lazily on the first
+# task would put a network dependency in the hot path.
+RUN pip install --no-cache-dir "fastembed>=0.4.0"
 RUN mkdir -p "$FASTEMBED_CACHE_PATH" \
  && python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir='$FASTEMBED_CACHE_PATH')" \
  && chown -R appuser:appuser "$FASTEMBED_CACHE_PATH"
+
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
 
 COPY . .
 

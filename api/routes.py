@@ -9,8 +9,10 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
     status,
@@ -22,9 +24,10 @@ from sqlalchemy.orm import Session
 from api.schemas import JobCreatedResponse, JobDetail, JobListResponse, JobSummary
 from core.config import settings
 from core.database import get_db
-from core.models import Job, JobStatus, JobType
+from api.limiter import limiter
+from core.models import Job, JobPriority, JobStage, JobStatus, JobType
 from core.storage import FileTooLarge, get_storage
-from worker.celery_app import TASK_EXTRACT_TEXT, celery_app
+from worker.celery_app import TASK_EXTRACT_TEXT, celery_app, queue_for
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,16 @@ def _find_active_duplicate(db: Session, idempotency_key: str) -> Job | None:
     ).first()
 
 
+def _resolve_priority(requested: JobPriority | None, size_bytes: int) -> str:
+    """Explicit priority wins; otherwise large uploads step aside."""
+    if requested is not None:
+        return requested.value
+    if size_bytes > settings.LARGE_FILE_BYTES:
+        # One 40MB scan should not make a queue of one-page invoices wait.
+        return JobPriority.LOW.value
+    return JobPriority.NORMAL.value
+
+
 def _deduplicated_response(response: Response, existing: Job) -> JobCreatedResponse:
     # 200 rather than 202: nothing new was accepted for processing.
     response.status_code = status.HTTP_200_OK
@@ -68,9 +81,14 @@ def _deduplicated_response(response: Response, existing: Job) -> JobCreatedRespo
     status_code=status.HTTP_202_ACCEPTED,
     summary="Upload a document and queue it for processing",
 )
+@limiter.limit(settings.RATE_LIMIT_UPLOAD)
 def upload_job(
+    request: Request,
     response: Response,
     file: UploadFile = File(...),
+    priority: JobPriority | None = Form(
+        None, description="high, normal or low. Defaults by file size."
+    ),
     db: Session = Depends(get_db),
 ) -> JobCreatedResponse:
     file_name = (file.filename or "").strip()
@@ -110,11 +128,13 @@ def upload_job(
         )
         return _deduplicated_response(response, existing)
 
+    resolved_priority = _resolve_priority(priority, stored.size)
     job = Job(
         file_name=file_name,
         file_path=stored.key,
         job_type=JobType.DOCUMENT.value,
         status=JobStatus.PENDING.value,
+        priority=resolved_priority,
         max_retries=settings.DEFAULT_MAX_RETRIES,
         idempotency_key=stored.sha256,
     )
@@ -147,8 +167,9 @@ def upload_job(
             status.HTTP_500_INTERNAL_SERVER_ERROR, "Could not create the job"
         )
 
+    queue_name = queue_for(JobStage.EXTRACT_TEXT.value, resolved_priority)
     try:
-        celery_app.send_task(TASK_EXTRACT_TEXT, args=[str(job.id)], queue="default")
+        celery_app.send_task(TASK_EXTRACT_TEXT, args=[str(job.id)], queue=queue_name)
     except Exception as exc:
         # The broker is unreachable. Settle the job rather than leaving it
         # PENDING forever with nothing to pick it up.
@@ -161,7 +182,13 @@ def upload_job(
             "Job was recorded but could not be queued; the broker is unavailable",
         ) from exc
 
-    logger.info("Queued job %s for %s (%s bytes)", job.id, file_name, stored.size)
+    logger.info(
+        "Queued job %s for %s (%s bytes) on %s",
+        job.id,
+        file_name,
+        stored.size,
+        queue_name,
+    )
     return JobCreatedResponse(
         job_id=job.id,
         status=job.status,
