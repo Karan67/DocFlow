@@ -35,11 +35,18 @@ pytestmark = pytest.mark.integration
 @pytest.fixture
 def s3_storage():
     """A real S3 client pointed at MinIO, in a per-test key prefix."""
+    # Fail loudly rather than falling back to a hostname that only resolves
+    # inside the Docker network, and rather than skipping - a silently skipped
+    # storage test is worse than no test.
+    assert settings.S3_ENDPOINT_URL, (
+        "S3_ENDPOINT_URL must point at an S3-compatible endpoint to run these "
+        "tests. Locally: docker compose up -d minio minio-init"
+    )
     return S3Storage(
         bucket=settings.S3_BUCKET,
         max_bytes=settings.MAX_UPLOAD_BYTES,
         prefix=f"test-{uuid.uuid4().hex}/",
-        endpoint_url=settings.S3_ENDPOINT_URL or "http://minio:9000",
+        endpoint_url=settings.S3_ENDPOINT_URL,
         region=settings.AWS_REGION,
     )
 

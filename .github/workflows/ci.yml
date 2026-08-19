@@ -47,6 +47,9 @@ jobs:
       AWS_ACCESS_KEY_ID: docflow
       AWS_SECRET_ACCESS_KEY: docflowsecret
       AWS_REGION: us-east-1
+      # Pinned so the cache step below restores to the path fastembed uses;
+      # its default location varies by version.
+      FASTEMBED_CACHE_PATH: /home/runner/.cache/fastembed
 
     steps:
       - uses: actions/checkout@v4
@@ -91,10 +94,15 @@ jobs:
 
       - name: Create the bucket
         # S3 buckets are not created implicitly on first write.
+        #
+        # Run inside the container that is already up: `mc` is bundled in the
+        # minio image, so this needs no second container, no entrypoint
+        # override (minio/mc sets ENTRYPOINT ["mc"], which silently turns
+        # `sh -c ...` into `mc sh -c ...`), and no host-networking assumption.
         run: |
-          docker run --rm --network host minio/mc:latest sh -c "
-            mc alias set local http://127.0.0.1:9000 docflow docflowsecret &&
-            mc mb --ignore-existing local/docflow-uploads"
+          docker exec minio mc alias set local http://127.0.0.1:9000 docflow docflowsecret
+          docker exec minio mc mb --ignore-existing local/docflow-uploads
+          docker exec minio mc ls local/
 
       - name: Install Python dependencies
         run: pip install -r requirements-dev.txt
@@ -103,7 +111,7 @@ jobs:
         # ~130MB. Downloading it on every run would dominate the job.
         uses: actions/cache@v4
         with:
-          path: ~/.cache/fastembed
+          path: /home/runner/.cache/fastembed
           key: fastembed-bge-small-en-v1.5
 
       - name: Run migrations
