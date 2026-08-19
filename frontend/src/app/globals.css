@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-ink-950 text-slate-200 antialiased;
+}
+
+/* Wide content (the extracted-text panel, long errors) scrolls inside its own
+   box rather than making the page scroll sideways. */
+.scroll-box {
+  @apply overflow-x-auto;
+}

@@ -15,6 +15,7 @@ from slowapi.errors import RateLimitExceeded
 
 from api.limiter import limiter
 from api.routes import router as jobs_router
+from api.stats import router as stats_router
 from api.schemas import HealthResponse
 from core.config import configure_logging, settings
 from core.database import engine
@@ -45,6 +46,7 @@ app.add_middleware(
 )
 
 app.include_router(jobs_router)
+app.include_router(stats_router)
 
 
 def _check_database() -> str:

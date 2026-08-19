@@ -71,3 +71,25 @@ class HealthResponse(BaseModel):
     status: str
     database: str
     broker: str
+
+
+class QueueDepth(BaseModel):
+    name: str
+    #: Messages waiting in Redis. None when the broker could not be reached.
+    depth: int | None = None
+    #: False for `ocr`, which has its own dedicated worker pool.
+    is_priority_queue: bool = True
+
+
+class StatsResponse(BaseModel):
+    """Snapshot for the dashboard. Cheap enough to poll every few seconds."""
+
+    queues: list[QueueDepth]
+    #: Every status, zero-filled, so a polling UI does not reflow as keys
+    #: appear and disappear.
+    jobs_by_status: dict[str, int]
+    #: Stage breakdown of jobs that have not finished yet.
+    active_by_stage: dict[str, int]
+    total_jobs: int
+    total_chunks: int
+    broker_reachable: bool

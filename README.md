@@ -4,10 +4,10 @@ Upload a document, get a job id back immediately, poll for the result. The API
 never does the slow work — Celery workers do, in separate processes that can
 crash and restart without taking the API down.
 
-**Status: Phase 4 complete.** A three-stage ingestion pipeline - text
+**Status: Phase 5 complete.** A three-stage ingestion pipeline - text
 extraction, OCR fallback for scans, and embeddings into pgvector - with
-retries, dead-lettering, idempotency, priority queues and rate limiting.
-See [PLAN.md](PLAN.md) for the roadmap.
+retries, dead-lettering, idempotency, priority queues, rate limiting and a
+live dashboard. See [PLAN.md](PLAN.md) for the roadmap.
 
 ```
 POST /jobs/upload ──> FastAPI ──> Postgres (job row, PENDING)
@@ -39,8 +39,11 @@ the same retry and dead-letter machinery.
 docker compose up -d --build
 ```
 
-Seven containers come up: `postgres`, `redis`, `api`, `worker`, `worker-ocr`,
-`beat`, `flower`. Migrations run automatically before the API starts serving.
+Eight containers come up: `postgres`, `redis`, `api`, `worker`, `worker-ocr`,
+`beat`, `flower`, `frontend`. Migrations run automatically before the API
+starts serving.
+
+**Open http://localhost:3001** for the dashboard.
 
 Two worker pools, on purpose:
 
@@ -54,6 +57,7 @@ two never share a queue.
 
 | Service | URL | Note |
 |---|---|---|
+| **Dashboard** | **http://localhost:3001** | Upload, live job table, stage timeline |
 | API | http://localhost:8001 | |
 | Swagger UI | http://localhost:8001/docs | Easiest way to try an upload |
 | Health | http://localhost:8001/health | Checks DB + broker; 503 if either is down |
@@ -96,6 +100,7 @@ docker compose logs -f worker
 | `POST` | `/jobs/upload` | Accepts a PDF, stores it, creates a job, enqueues it. `202` + `job_id` |
 | `GET` | `/jobs/{job_id}` | Full record: status, `result`, `error_message`, timestamps |
 | `GET` | `/jobs` | Recent jobs, newest first. `?limit=`, `?offset=`, `?status=` |
+| `GET` | `/stats` | Queue depths and job counts, for the dashboard |
 | `GET` | `/health` | Readiness probe |
 
 Currently accepts `.pdf` only (`415` otherwise), rejects empty files (`400`)
@@ -157,10 +162,12 @@ the reaper needs it that way. The timeline is in `stages`.
 
 ```
 core/       config, database session, models + state machine, storage      <- shared
-api/        FastAPI app, routes, schemas                                   <- producer
+api/        FastAPI app, routes, stats, schemas, limiter                    <- producer
 worker/     celery_app, tasks (stage runner), extract, ocr, embed          <- consumer
+frontend/   Next.js dashboard (App Router, Tailwind)                       <- UI
 alembic/    migrations
-tests/      unit (extract) + integration (full flow)
+scripts/    container entrypoints
+tests/      unit (pure logic) + integration (full flow against Postgres)
 ```
 
 `core/` exists so the API and worker share one definition of a job without
@@ -327,6 +334,40 @@ the configured rate.
 **Only the write endpoint is limited.** Rate-limiting status polling would
 break the core interaction: clients are *told* to poll.
 
+### Dashboard (Phase 5)
+
+**Queue depth needed a backend endpoint.** The browser cannot read Redis, so
+`GET /stats` exposes it - four `LLEN`s and two grouped counts, cheap enough to
+poll every two seconds. It is the one metric that answers "are the workers
+keeping up".
+
+**Depth counts waiting messages only.** Work already handed to a worker has
+been popped off the list, so a saturated system can legitimately show zero.
+The dashboard says so on the panel rather than letting the number mislead.
+
+**Both breakdowns are zero-filled server-side.** Returning only non-zero
+statuses would make the dashboard's layout jump every time a count reached
+zero.
+
+**The stats endpoint degrades instead of failing.** If Redis is unreachable,
+queue depths come back `null` with `broker_reachable: false` and the
+Postgres-backed half still answers. A dashboard that 500s the moment the broker
+blips is worse than one that says which half it cannot see.
+
+**The dashboard polls; it does not stream.** That matches the API's actual
+contract - status lives in Postgres and clients are told to poll - and the job
+detail view stops polling once a job reaches a terminal state, so a tab left
+open goes quiet instead of hammering the API forever.
+
+**The stage timeline is the point of the detail view.** A mid-pipeline failure
+shows the job status as failed and the timeline shows *which* step failed, how
+long the earlier ones took, and how many attempts each needed.
+
+**`NEXT_PUBLIC_API_BASE_URL` is a build arg, not a runtime env var.** Next
+inlines `NEXT_PUBLIC_` values into the client bundle at build time, and it has
+to be an address the *browser* can reach - not the Docker-internal
+`http://api:8000`.
+
 ---
 
 ## Tests
@@ -335,7 +376,7 @@ break the core interaction: clients are *told* to poll.
 docker compose exec api pytest -v
 ```
 
-67 tests: extraction, OCR-routing, chunking and queue-routing unit tests (no
+74 tests: extraction, OCR-routing, chunking and queue-routing unit tests (no
 DB or broker),
 the full upload → DONE flow, Phase 2's reliability behaviour — retry-then-succeed,
 dead-lettering, permanent failures skipping retries, backoff growth and jitter,
@@ -411,6 +452,18 @@ lives in Redis. Inspect with
 `docker compose exec redis redis-cli --scan --pattern 'LIMITS:*'`, or wait out
 the minute.
 
+**Dashboard shows "Cannot reach the API"** — the browser, not the container, has
+to reach the API. Check http://localhost:8001/health directly. If you changed
+`NEXT_PUBLIC_API_BASE_URL`, the frontend needs a rebuild, not a restart: the
+value is inlined at build time.
+
+**Dashboard is empty but jobs exist** — a stale bundle pointing at the wrong
+API origin. `docker compose build frontend && docker compose up -d frontend`.
+
+**A job sits in `PENDING` forever** — the row was committed but never enqueued,
+which in practice only happens if the API dies between the two. The reaper
+sweeps `PROCESSING`, not `PENDING`, so nothing rescues it. See PLAN.md.
+
 **A text PDF got sent to OCR** — its text layer averages under
 `OCR_MIN_CHARS_PER_PAGE` (40) characters per page. Sparse documents (a title
 page, a mostly-blank form) can trip this. The result is still correct, just
@@ -434,6 +487,5 @@ That is fine on localhost; it must not be set on a public deployment.
 
 ## Next
 
-Phase 5 is observability: Flower has been running since Phase 0, so this is the
-Next.js dashboard on `GET /jobs` — upload form, live status table, stage
-timeline, retry counts and queue depths. [PLAN.md](PLAN.md) has the detail.
+Phase 6 is deployment: S3 behind the existing `Storage` interface, an AWS
+deploy, and a GitHub Actions CI pipeline. [PLAN.md](PLAN.md) has the detail.

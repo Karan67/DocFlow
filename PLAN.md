@@ -136,16 +136,33 @@ stage ran entirely on the dedicated pool (`queued ocr on ocr`) and handed back
 to the fast pool on `high`, and the rate limiter allowed exactly 30 requests
 before returning 429.
 
-## Phase 5 — Observability & UI ⬅ next
-
-Flower has been running since Phase 0, so this is the Next.js dashboard on
-`GET /jobs`: upload form, live status table, retry counts. CORS is already
-configured for `localhost:3001`.
+## Phase 5 — Observability & UI ✅ done
 
 Keeping the frontend out of Phases 0–4 was deliberate — curl, Swagger and
-Flower cover everything until there is something worth showing.
+Flower covered everything until there was something worth showing. By Phase 5
+there is: four queues, two worker pools, three pipeline stages and six job
+statuses.
 
-## Phase 6 — Deploy
+- ✅ `GET /stats` — queue depths plus job counts. This was not in the plan but
+  the dashboard needs it: the browser cannot read Redis, and queue depth is the
+  one number that answers "are the workers keeping up".
+- ✅ Next.js dashboard (App Router, Tailwind, no runtime deps beyond React):
+  upload form with priority, live job table, and a per-job stage timeline.
+- ✅ The detail view stops polling once a job is terminal, so a tab left open
+  goes quiet rather than hammering the API.
+- ✅ `/stats` degrades instead of failing when Redis is down — depths come back
+  `null` with `broker_reachable: false` and the Postgres half still answers.
+- ✅ Multi-stage Docker build using Next's `standalone` output.
+
+**Done when:** you can upload a document and watch it move without touching a
+terminal. ✅ Verified in a real browser: uploaded through the form with
+priority `high`, watched the row appear as `Pending → Processing → Failed`
+(deliberately malformed PDF), and confirmed the OCR job's detail page renders
+the full timeline — `Extract 2ms → "no usable text layer -> ocr"`,
+`OCR 784ms → 351 chars`, `Embed 248ms → 1 chunk`. Polling measured at exactly
+5 requests per 10s against a 2s interval, no console errors, CORS clean.
+
+## Phase 6 — Deploy ⬅ next
 
 - S3 behind the existing `Storage` interface — a one-file change by design
 - AWS deploy (EC2 for API + worker, S3 for files)
@@ -153,6 +170,16 @@ Flower cover everything until there is something worth showing.
   wiring rather than writing.
 - Split `requirements-dev.txt` out of the runtime image
 - Put auth in front of Flower and drop `FLOWER_UNAUTHENTICATED_API`
+- Split the API image from the worker's — the API needs neither tesseract nor
+  the embedding model, and the shared image is ~950MB
+- Trusted-proxy config so the rate limiter sees real client IPs rather than the
+  load balancer's
+
+**Known gap to close:** a job committed but never enqueued sits in `PENDING`
+forever. The reaper sweeps `PROCESSING`, not `PENDING`. In practice this only
+happens if the API dies between the commit and the `send_task`, but the fix is
+small — widen the sweep to `PENDING` rows older than a threshold with no
+`started_at`.
 
 ---
 
@@ -174,3 +201,4 @@ Flower cover everything until there is something worth showing.
 | OCR as a fallback inside `extract_text` | OCR as its own stage | Reading a text layer is microseconds, OCR is seconds per page. One name for both makes queue behaviour unpredictable |
 | priority queues only | priority queues **plus** a dedicated `ocr` queue and pool | Priority reorders a queue; it does not stop a 60s task blocking a 2ms one. Only a separate pool does that |
 | "small files processed before large ones" | large files auto-demoted to `low` | Same intent, expressed as a default rather than a sort: the queue does the ordering, and an explicit priority can still override it |
+| dashboard hitting `GET /jobs` only | added `GET /stats` | Queue depth is the headline metric for a queue system and the browser cannot read Redis. `GET /jobs` alone cannot answer "are the workers keeping up" |

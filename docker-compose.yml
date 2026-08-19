@@ -139,6 +139,21 @@ services:
       redis:
         condition: service_healthy
 
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Inlined into the client bundle at build time, so it must be an
+        # address the browser can reach - not the internal http://api:8000.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8001}
+    container_name: docflow_frontend
+    ports:
+      - "${FRONTEND_PORT:-3001}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
