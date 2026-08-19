@@ -23,8 +23,14 @@ class Base(DeclarativeBase):
 class JobStatus(str, Enum):
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
+    #: Transient failure; a retry is scheduled. See `next_retry_at`.
+    RETRYING = "RETRYING"
     DONE = "DONE"
+    #: Permanent failure - the input itself is bad, so retrying cannot help.
     FAILED = "FAILED"
+    #: Retries were exhausted. Distinct from FAILED so "we gave up" is
+    #: queryable separately from "this input was never going to work".
+    DEAD_LETTER = "DEAD_LETTER"
 
 
 class JobType(str, Enum):
@@ -32,14 +38,32 @@ class JobType(str, Enum):
 
 
 #: Statuses from which no further transition is possible.
-TERMINAL_STATUSES: frozenset[str] = frozenset({JobStatus.DONE, JobStatus.FAILED})
+TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {JobStatus.DONE, JobStatus.FAILED, JobStatus.DEAD_LETTER}
+)
 
-#: The explicit state machine. Phase 2 adds RETRYING and DEAD_LETTER here.
+#: Statuses a task is allowed to claim work from.
+CLAIMABLE_STATUSES: frozenset[str] = frozenset(
+    {JobStatus.PENDING, JobStatus.RETRYING}
+)
+
+#: The explicit state machine.
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     JobStatus.PENDING: frozenset({JobStatus.PROCESSING, JobStatus.FAILED}),
-    JobStatus.PROCESSING: frozenset({JobStatus.DONE, JobStatus.FAILED}),
+    JobStatus.PROCESSING: frozenset(
+        {
+            JobStatus.DONE,
+            JobStatus.FAILED,
+            JobStatus.RETRYING,
+            JobStatus.DEAD_LETTER,
+        }
+    ),
+    JobStatus.RETRYING: frozenset(
+        {JobStatus.PROCESSING, JobStatus.FAILED, JobStatus.DEAD_LETTER}
+    ),
     JobStatus.DONE: frozenset(),
     JobStatus.FAILED: frozenset(),
+    JobStatus.DEAD_LETTER: frozenset(),
 }
 
 
@@ -55,7 +79,8 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('PENDING', 'PROCESSING', 'DONE', 'FAILED')",
+            "status IN ('PENDING', 'PROCESSING', 'RETRYING', 'DONE', "
+            "'FAILED', 'DEAD_LETTER')",
             name="ck_jobs_status",
         ),
         CheckConstraint("retry_count >= 0", name="ck_jobs_retry_count_non_negative"),
@@ -86,6 +111,16 @@ class Job(Base):
     )
     result: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # SHA-256 of the uploaded bytes. Re-uploading identical content returns the
+    # existing job instead of processing it twice. Enforced by a *partial*
+    # unique index that excludes failed jobs, so a genuine retry after failure
+    # is still allowed - see migration 0002.
+    idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: When the next attempt is due, while status is RETRYING.
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

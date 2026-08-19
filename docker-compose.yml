@@ -86,6 +86,19 @@ services:
       api:
         condition: service_healthy
 
+  beat:
+    <<: *app
+    container_name: docflow_beat
+    init: true
+    # Schedules the stale-job reaper. Keep exactly one beat instance
+    # running - two would double-fire every scheduled task.
+    command: >
+      celery -A worker.celery_app beat --loglevel=INFO
+      --schedule=/tmp/celerybeat-schedule
+    depends_on:
+      api:
+        condition: service_healthy
+
   flower:
     <<: *app
     container_name: docflow_flower

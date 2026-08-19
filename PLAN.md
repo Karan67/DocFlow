@@ -11,6 +11,7 @@ Target CV bullet, one clause added per phase:
 ## Phase 0 — Scaffold ✅ done
 
 Compose stack with five services: `postgres`, `redis`, `api`, `worker`, `flower`.
+(Phase 2 added a sixth, `beat`, to schedule the reaper.)
 
 Flower was pulled forward from Phase 5 — it is ~10 lines of compose and turns
 Phase 1 debugging from guesswork into a live view of tasks landing.
@@ -37,28 +38,42 @@ returns.
 
 ---
 
-## Phase 2 — Reliability ⬅ next
+## Phase 2 — Reliability ✅ done
 
 Deliberately **before** the OCR/embedding work: this is the part that carries
 the CV bullet, all of it is testable with a task that raises on demand, and OCR
 drags a ~300MB tesseract dependency into the image that would slow every
 rebuild while iterating on retry logic.
 
-- `autoretry_for` + `retry_backoff` + `retry_jitter`; a `RETRYING` status and
-  `retry_count` that actually increments
-- Dead-letter: past `max_retries`, settle as terminal `FAILED` with the
-  traceback in `error_message`
-- **`acks_late=True`** so a SIGKILLed worker's task returns to the queue instead
-  of vanishing — the reliability question interviewers actually ask
-- Idempotency keyed on the **SHA-256 of the file bytes**, unique-indexed.
-  `core/storage.py` already computes it on upload. This is also what makes
-  `acks_late` safe, since re-delivered tasks must be idempotent
-- A Celery Beat reaper that resets jobs stuck in `PROCESSING` past a threshold —
-  otherwise a dead worker's jobs sit there forever
+- ✅ Exponential backoff with full jitter; `RETRYING` status, `next_retry_at`,
+  and a `retry_count` that increments
+- ✅ Failures classified: bad input goes straight to `FAILED` without burning
+  retries; transient errors back off. This was **not** in the original spec and
+  turned out to be the most useful decision in the phase
+- ✅ Dead-letter as its own status rather than a flag on `FAILED`, so "we gave
+  up" is queryable separately from "this input never had a chance"
+- ✅ **`acks_late=True`** plus `task_reject_on_worker_lost`, with reclaims
+  charged against the retry budget so redelivery cannot loop forever
+- ✅ Idempotency keyed on the **SHA-256 of the file bytes**, under a *partial*
+  unique index excluding failed jobs, so a genuine retry after failure still
+  works. `IntegrityError` is caught so a concurrent duplicate loses gracefully
+- ✅ A Celery Beat reaper sweeping jobs orphaned in `PROCESSING`, using
+  `FOR UPDATE SKIP LOCKED`
+- ✅ Task time limits, so one hung task cannot hold a slot forever
 
-Schema additions: `idempotency_key`, and widen the `ck_jobs_status` constraint.
+Schema (migration `0002`): `idempotency_key`, `next_retry_at`, a widened
+`ck_jobs_status`, the partial unique index, and a partial index for the sweep.
 
-## Phase 3 — Real processing
+**Done when:** the retry ladder, dead-lettering and dedup all hold. ✅ Verified:
+27 tests green, plus an end-to-end run through the real broker — a job forced
+into orphaned `PROCESSING` was reclaimed by the reaper, requeued, and completed
+by the live worker as "attempt 2/4".
+
+Deferred deliberately: fault injection in production code. The retry paths are
+covered by tests that monkeypatch the extractor, so nothing test-only ships in
+the worker.
+
+## Phase 3 — Real processing ⬅ next
 
 - OCR via `pytesseract` (needs `tesseract-ocr` + `poppler-utils` in the image)
 - Second job type: embedding generation
@@ -106,3 +121,6 @@ Flower cover everything until there is something worth showing.
 | "raw psycopg2 if you want it fast-and-dirty" | SQLAlchemy + Alembic | The schema changes in Phases 2 and 4; a `schema.sql` seeded via `docker-entrypoint-initdb.d` only runs on an empty volume, so every change means wiping the DB |
 | Redis as broker *and* status store | Redis broker; Postgres is the only source of truth for status | Two answers to "is my job done" will drift |
 | `frontend/` in the Phase 1 tree | deferred to Phase 5 | Keeps UI work from eating backend time |
+| `autoretry_for` + `retry_backoff` | explicit `self.retry()` with failures classified first | `autoretry_for` retries *everything*, including corrupt input that can never succeed. Classifying first is the difference between a retry policy and a busy-wait |
+| "after `max_retries`, mark permanently FAILED" | a distinct `DEAD_LETTER` status | "we gave up" and "this input was never going to work" need different responses; merging them makes the failure list unactionable |
+| plain unique index on `idempotency_key` | *partial* unique index excluding failed jobs | A plain unique index would permanently block re-uploading a file whose job failed |
