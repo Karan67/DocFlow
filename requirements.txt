@@ -1,0 +1,19 @@
+# --- API ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+
+# --- Persistence ---
+SQLAlchemy>=2.0.36
+psycopg2-binary>=2.9.10
+alembic>=1.14.0
+
+# --- Queue ---
+celery[redis]>=5.4.0
+redis>=5.2.0
+flower>=2.0.1
+
+# --- Processing (Phase 1: PDF text extraction only) ---
+pypdf>=5.1.0

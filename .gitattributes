@@ -1,0 +1,13 @@
+# This project runs in Linux containers - normalise everything to LF in the
+# repo and on checkout, regardless of the contributor's platform.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted.
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
