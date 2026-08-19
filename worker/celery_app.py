@@ -43,6 +43,9 @@ QUEUE_OCR = "ocr"
 #: Queues the fast worker pool drains, most urgent first.
 FAST_QUEUES: tuple[str, ...] = (QUEUE_HIGH, QUEUE_DEFAULT, QUEUE_LOW)
 
+#: Every queue in the topology, in the order a dashboard should show them.
+ALL_QUEUES: tuple[str, ...] = (QUEUE_HIGH, QUEUE_DEFAULT, QUEUE_LOW, QUEUE_OCR)
+
 #: JobPriority value -> queue name.
 PRIORITY_QUEUES: dict[str, str] = {
     "high": QUEUE_HIGH,
