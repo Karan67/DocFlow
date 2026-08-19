@@ -38,25 +38,12 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 3s --health-retries 12
 
-      minio:
-        # bitnami's image starts the server without a command override, which
-        # GitHub service containers cannot supply, and creates the bucket for us.
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: docflow
-          MINIO_ROOT_PASSWORD: docflowsecret
-          MINIO_DEFAULT_BUCKETS: docflow-uploads
-        ports: ["9000:9000"]
-        options: >-
-          --health-cmd "mc ready local"
-          --health-interval 5s --health-timeout 5s --health-retries 24
-
     env:
       DATABASE_URL: postgresql+psycopg2://docflow:docflow@localhost:5432/docflow
       REDIS_URL: redis://localhost:6379/0
       UPLOAD_DIR: /tmp/docflow-uploads
       S3_BUCKET: docflow-uploads
-      S3_ENDPOINT_URL: http://localhost:9000
+      S3_ENDPOINT_URL: http://127.0.0.1:9000
       AWS_ACCESS_KEY_ID: docflow
       AWS_SECRET_ACCESS_KEY: docflowsecret
       AWS_REGION: us-east-1
@@ -76,6 +63,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             tesseract-ocr tesseract-ocr-eng poppler-utils
+
+      - name: Start MinIO
+        # Not a service container: those cannot override the image's command,
+        # and minio/minio needs `server /data`. Running it as a step also keeps
+        # CI on the same image the local stack uses, rather than a third party
+        # repackage whose tags can disappear underneath us.
+        run: |
+          docker run -d --name minio -p 9000:9000             -e MINIO_ROOT_USER=docflow             -e MINIO_ROOT_PASSWORD=docflowsecret             minio/minio:latest server /data
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              echo "MinIO ready after ${attempt} attempt(s)"
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "MinIO did not become ready" >&2
+              docker logs minio >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Create the bucket
+        # S3 buckets are not created implicitly on first write.
+        run: |
+          docker run --rm --network host minio/mc:latest sh -c "
+            mc alias set local http://127.0.0.1:9000 docflow docflowsecret &&
+            mc mb --ignore-existing local/docflow-uploads"
 
       - name: Install Python dependencies
         run: pip install -r requirements-dev.txt
