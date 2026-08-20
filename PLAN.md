@@ -4,7 +4,14 @@ Target CV bullet, one clause added per phase:
 
 > *"Built a distributed job processing system (FastAPI, Celery, Redis, PostgreSQL)
 > handling asynchronous document processing with retry-with-backoff, dead-letter
-> handling, and priority queues; deployed on AWS with a live monitoring dashboard."*
+> handling, and priority queues; containerised across 11 services with a live
+> monitoring dashboard and CI."*
+
+The original target ended "deployed on AWS". That clause was dropped rather
+than fudged: the deployment runbook is written and the application is
+deployment-ready, but nothing has been deployed, and a CV bullet that says
+otherwise is a question you do not want to be asked in an interview.
+See [DEPLOY.md](DEPLOY.md).
 
 ---
 
