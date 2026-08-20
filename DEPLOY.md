@@ -24,6 +24,7 @@ written to be run deliberately rather than triggered by a script in the repo.
                           │ worker,      │
                           │ worker-ocr,  │──────▶ S3 (documents)
                           │ beat, flower │
+                          │ flower-auth  │
                           └──────────────┘
 ```
 
@@ -91,6 +92,7 @@ S3_BUCKET=your-bucket
 AWS_REGION=eu-west-2
 FLOWER_USER=...
 FLOWER_PASSWORD=...
+FLOWER_SESSION_SECRET=...   # python -c "import secrets; print(secrets.token_urlsafe(32))"
 NEXT_PUBLIC_API_BASE_URL=https://api.your-domain
 TRUSTED_PROXY_COUNT=1
 ```
@@ -115,7 +117,7 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml \
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-  up -d --build worker worker-ocr beat flower
+  up -d --build worker worker-ocr beat flower flower-auth
 ```
 
 Services are named explicitly because the base compose file also defines
@@ -133,10 +135,16 @@ healthy while still finishing recovery, and a single attempt fails there.
 |---|---|
 | `frontend` (3000) | public, behind the ALB |
 | `api` (8000) | public, behind the ALB |
-| `flower` (5555) | **private** — VPN or SSH tunnel only |
+| `flower-auth` (8080) | **private** — VPN or SSH tunnel only |
+| `flower` (5555) | not published at all; reachable only from `flower-auth` |
 
-Flower can revoke and terminate tasks. Basic auth is on, but it is an admin
-surface and should not be internet-reachable regardless.
+Flower can revoke and terminate tasks. It sits behind a login page
+(`flowerauth/`) rather than HTTP basic auth, but it is an admin surface and
+should not be internet-reachable regardless.
+
+If it is ever exposed through the load balancer, terminate TLS in front of it:
+the login form posts credentials, and the session cookie is only as safe as the
+transport carrying it.
 
 ---
 
