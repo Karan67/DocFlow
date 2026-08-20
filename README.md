@@ -12,6 +12,11 @@ retries, dead-lettering, idempotency, priority queues, rate limiting, a live
 dashboard, S3 storage and CI. See [PLAN.md](PLAN.md) for the roadmap and
 [DEPLOY.md](DEPLOY.md) for the AWS runbook.
 
+![The DocFlow dashboard: queue depths, job states and per-stage progress](docs/img/dashboard.png)
+
+*Queue depth per priority, live job states, and retry counts - polled every two
+seconds. `Failed` and `Dead letter` are separate states on purpose.*
+
 ```
 POST /jobs/upload ──> FastAPI ──> Postgres (job row, PENDING)
                          │
@@ -137,6 +142,11 @@ stay free, or the API stops answering the one question it exists to answer.
 going to work" and "we kept trying and gave up" need different responses, and
 mixing them makes the failure list useless.
 
+![A dead-lettered job showing retries exhausted](docs/img/dead-letter.png)
+
+*A job the reaper could never enqueue, dead-lettered after exhausting its retry
+budget. The error says which of the two failure modes this was.*
+
 ### Pipeline stages
 
 `stage` names the step currently running (or the one that failed):
@@ -153,6 +163,12 @@ how many attempts it needed, and what it produced:
   {"stage": "embed", "status": "DONE", "duration_ms": 248, "detail": {"attempts": 1}}
 ]
 ```
+
+![A scanned PDF moving through extract, OCR and embed](docs/img/pipeline.png)
+
+*A scan with no text layer: extraction finds nothing usable in 2ms and routes
+to OCR, which recovers 351 characters from pure pixels, and the embed stage
+writes one vector chunk. The recovered text is shown below the timeline.*
 
 That is how a mid-pipeline failure stays legible: the job status says it
 failed, `stages` says which step failed and what the earlier ones produced.
@@ -433,6 +449,8 @@ port instead: a small Starlette app that serves a real form, sets a signed
 session cookie, and reverse-proxies everything through. Flower's UI is plain
 HTTP - it polls over AJAX and registers no websocket handlers - so a
 request/response proxy is enough.
+
+![The Flower login page](docs/img/flower-login.png)
 
 It runs on the lean `api` image, since it imports no Celery. Two details worth
 noting: `?next=` is restricted to relative paths so it cannot become an open
