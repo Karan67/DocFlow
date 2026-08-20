@@ -4,10 +4,13 @@ Upload a document, get a job id back immediately, poll for the result. The API
 never does the slow work — Celery workers do, in separate processes that can
 crash and restart without taking the API down.
 
-**Status: Phase 5 complete.** A three-stage ingestion pipeline - text
+[![CI](https://github.com/Karan67/DocFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/Karan67/DocFlow/actions/workflows/ci.yml)
+
+**Status: Phase 6 complete.** A three-stage ingestion pipeline - text
 extraction, OCR fallback for scans, and embeddings into pgvector - with
-retries, dead-lettering, idempotency, priority queues, rate limiting and a
-live dashboard. See [PLAN.md](PLAN.md) for the roadmap.
+retries, dead-lettering, idempotency, priority queues, rate limiting, a live
+dashboard, S3 storage and CI. See [PLAN.md](PLAN.md) for the roadmap and
+[DEPLOY.md](DEPLOY.md) for the AWS runbook.
 
 ```
 POST /jobs/upload ──> FastAPI ──> Postgres (job row, PENDING)
@@ -334,6 +337,13 @@ the configured rate.
 **Only the write endpoint is limited.** Rate-limiting status polling would
 break the core interaction: clients are *told* to poll.
 
+**`X-Forwarded-For` is only trusted when the hop count is declared.** The
+header is appended to by each proxy and the client controls the left-hand
+entries, so taking the leftmost value - the usual mistake - lets anyone send a
+random address and get a fresh quota per request. `TRUSTED_PROXY_COUNT` says
+how many proxies are in front, and only that many entries back from the right
+are believed. See [api/limiter.py](api/limiter.py).
+
 ### Dashboard (Phase 5)
 
 **Queue depth needed a backend endpoint.** The browser cannot read Redis, so
@@ -368,15 +378,64 @@ inlines `NEXT_PUBLIC_` values into the client bundle at build time, and it has
 to be an address the *browser* can reach - not the Docker-internal
 `http://api:8000`.
 
+### Deployment (Phase 6)
+
+**The storage swap needed no migration, which was the whole bet.** `file_path`
+has held an opaque key since Phase 1, so switching to S3 changed one file.
+`STORAGE_BACKEND=s3` is the entire operation.
+
+| Backend | Used by |
+|---|---|
+| `local` | shared Docker volume, local development |
+| `s3` | MinIO locally, real S3 in production |
+
+Both are tested with the *same* assertions in
+[tests/test_storage.py](tests/test_storage.py) — that parity is the claim the
+abstraction was making. They run against MinIO rather than a mock, because a
+mock would have passed while telling us nothing about whether the endpoint
+wiring works or whether `open()` returns something pypdf can seek in. S3's
+streaming body is forward-only and a PDF's cross-reference table lives at the
+end of the file, so the S3 backend downloads into a seekable buffer.
+
+**No credentials in application config.** boto3 resolves environment variables
+in development and an instance role in production. `core/storage.py` never
+reads an access key.
+
+**The images are split.** The API is 411MB; the worker is 976MB. Only the
+workers need tesseract, poppler and the embedding model, and the API is the
+service that scales horizontally.
+
+| Target | Contents | Services |
+|---|---|---|
+| `api` | shared runtime only | `api` |
+| `worker` | + OCR system packages, processing deps, embedding model | `worker`, `worker-ocr`, `beat`, `flower` |
+| `dev` | + test dependencies | local compose, CI |
+
+`beat` and `flower` sit on the worker image for a non-obvious reason: Celery's
+`imports` setting makes **every** `celery -A` entrypoint load `worker.tasks`,
+so they pull in the processing dependencies whether they use them or not.
+
+**The reaper now sweeps `PENDING` as well as `PROCESSING`.** A job committed but
+never enqueued — the API dying between the two — was previously stuck forever,
+because no worker had ever claimed it. Reviving costs a retry, so a job whose
+enqueue keeps failing dead-letters rather than looping.
+
+**Flower has basic auth and is not internet-facing.** It can revoke and
+terminate tasks, so it is an admin surface, not a status page.
+
 ---
 
 ## Tests
 
 ```bash
-docker compose exec api pytest -v
+docker compose exec worker pytest -v
 ```
 
-74 tests: extraction, OCR-routing, chunking and queue-routing unit tests (no
+Tests run in the **worker** container, not the API one: they drive the full
+pipeline, and the API image deliberately does not carry tesseract, poppler or
+the embedding model.
+
+102 tests: extraction, OCR-routing, chunking and queue-routing unit tests (no
 DB or broker),
 the full upload → DONE flow, Phase 2's reliability behaviour — retry-then-succeed,
 dead-lettering, permanent failures skipping retries, backoff growth and jitter,
@@ -447,6 +506,16 @@ it should not be. `worker` must not include `ocr` in its `-Q` list.
 `worker_prefetch_multiplier` is 1. Either one missing silently degrades
 priority to round-robin.
 
+**Flower asks for a password** — it does now. Default `admin`/`admin` locally,
+set via `FLOWER_USER` / `FLOWER_PASSWORD`.
+
+**`ModuleNotFoundError` in beat or flower** — they were built from the `api`
+target. Celery loads `worker.tasks` in every `celery -A` entrypoint, so they
+need the worker image.
+
+**S3 tests fail locally** — MinIO is not up, or the bucket does not exist.
+`docker compose up -d minio minio-init` recreates both.
+
 **429s during local testing** — the limit is per IP per minute and its window
 lives in Redis. Inspect with
 `docker compose exec redis redis-cli --scan --pattern 'LIMITS:*'`, or wait out
@@ -487,5 +556,6 @@ That is fine on localhost; it must not be set on a public deployment.
 
 ## Next
 
-Phase 6 is deployment: S3 behind the existing `Storage` interface, an AWS
-deploy, and a GitHub Actions CI pipeline. [PLAN.md](PLAN.md) has the detail.
+All six phases are built. The remaining step is running the AWS deploy itself,
+which needs an AWS account and creates billable resources — the runbook is
+[DEPLOY.md](DEPLOY.md).

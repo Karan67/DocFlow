@@ -10,16 +10,45 @@ limiter would let through four times the configured rate.
 
 from __future__ import annotations
 
+import logging
+
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from starlette.requests import Request
 
 from core.config import settings
 
+logger = logging.getLogger(__name__)
+
+
+def client_ip(request: Request) -> str:
+    """The address to rate limit on.
+
+    `X-Forwarded-For` is appended to by each hop, and the client controls the
+    left-hand entries. Trusting the leftmost value - the common mistake - lets
+    anyone send `X-Forwarded-For: <random>` and get a fresh quota per request.
+
+    So the header is only consulted when the deployment declares how many
+    proxies it sits behind, and then only that many entries back from the
+    right, which is the part those proxies actually wrote.
+    """
+    hops = settings.TRUSTED_PROXY_COUNT
+    if hops > 0:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        entries = [part.strip() for part in forwarded.split(",") if part.strip()]
+        if len(entries) >= hops:
+            return entries[-hops]
+        logger.warning(
+            "X-Forwarded-For has %s entries but TRUSTED_PROXY_COUNT is %s; "
+            "falling back to the socket address",
+            len(entries),
+            hops,
+        )
+    return get_remote_address(request)
+
+
 limiter = Limiter(
-    # Behind a load balancer this sees the proxy's address, not the client's.
-    # Phase 6 needs a trusted-proxy config before this means anything in
-    # production - honouring X-Forwarded-For without one is trivially spoofed.
-    key_func=get_remote_address,
+    key_func=client_ip,
     storage_uri=settings.REDIS_URL,
     enabled=settings.RATE_LIMIT_ENABLED,
 )

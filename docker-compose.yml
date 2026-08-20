@@ -2,15 +2,23 @@ name: docflow
 
 # Shared build + environment for the three Python services.
 x-app: &app
-  build:
-    context: .
-    dockerfile: Dockerfile
   environment:
     DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-docflow}:${POSTGRES_PASSWORD:-docflow}@postgres:5432/${POSTGRES_DB:-docflow}
     REDIS_URL: redis://redis:6379/0
     UPLOAD_DIR: /data/uploads
     LOG_LEVEL: ${LOG_LEVEL:-INFO}
     MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-25000000}
+    # Flip STORAGE_BACKEND to "s3" to route uploads at MinIO instead of the
+    # shared volume. Nothing else changes - the rest of the code only handles
+    # an opaque key.
+    STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+    S3_BUCKET: ${S3_BUCKET:-docflow-uploads}
+    S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+    AWS_REGION: ${AWS_REGION:-us-east-1}
+    # MinIO's local root credentials - NOT real AWS keys. In production these
+    # are absent and boto3 resolves an instance role instead.
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-docflow}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-docflowsecret}
   volumes:
     # Source bind-mount for development; uploads is the shared volume that
     # lets the worker read what the API wrote.
@@ -56,8 +64,51 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  minio:
+    # Local stand-in for S3, so the S3 backend is exercised for real rather
+    # than mocked. Production points at AWS by unsetting S3_ENDPOINT_URL.
+    image: minio/minio:latest
+    container_name: docflow_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-docflow}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-docflowsecret}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  minio-init:
+    # One-shot: S3 buckets are not created implicitly on first write.
+    image: minio/mc:latest
+    container_name: docflow_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-docflow}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-docflowsecret}
+      S3_BUCKET: ${S3_BUCKET:-docflow-uploads}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/$$S3_BUCKET &&
+      echo 'bucket ready'"
+    restart: "no"
+
   api:
     <<: *app
+    build:
+      context: .
+      target: api
     container_name: docflow_api
     command: ["sh", "/app/scripts/start-api.sh", "--reload"]
     ports:
@@ -76,6 +127,9 @@ services:
 
   worker:
     <<: *app
+    build:
+      context: .
+      target: ${WORKER_TARGET:-dev}
     container_name: docflow_worker
     # init gives PID 1 proper signal handling so Celery gets a warm shutdown.
     init: true
@@ -94,6 +148,9 @@ services:
 
   worker-ocr:
     <<: *app
+    build:
+      context: .
+      target: ${WORKER_TARGET:-dev}
     container_name: docflow_worker_ocr
     init: true
     # A dedicated pool for the one genuinely slow stage. Concurrency 1 because
@@ -109,6 +166,14 @@ services:
 
   beat:
     <<: *app
+    build:
+      context: .
+      # Celery's `imports` setting makes every `celery -A` entrypoint
+      # load worker.tasks, so beat and flower need the processing
+      # dependencies too - not just the worker pools. Only the API
+      # itself, which is the service that scales horizontally, runs
+      # on the lean image.
+      target: ${WORKER_TARGET:-dev}
     container_name: docflow_beat
     init: true
     # Schedules the stale-job reaper. Keep exactly one beat instance
@@ -122,17 +187,28 @@ services:
 
   flower:
     <<: *app
+    build:
+      context: .
+      # Celery's `imports` setting makes every `celery -A` entrypoint
+      # load worker.tasks, so beat and flower need the processing
+      # dependencies too - not just the worker pools. Only the API
+      # itself, which is the service that scales horizontally, runs
+      # on the lean image.
+      target: ${WORKER_TARGET:-dev}
     container_name: docflow_flower
     init: true
-    command: celery -A worker.celery_app flower --address=0.0.0.0 --port=5555
+    # Basic auth covers the UI and the REST API together, which is why
+    # FLOWER_UNAUTHENTICATED_API is gone. Change the credentials before this is
+    # reachable from anywhere but localhost - Flower can revoke and terminate
+    # tasks, so it is an admin surface, not a status page.
+    command: >
+      celery -A worker.celery_app flower --address=0.0.0.0 --port=5555
+      --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
     environment:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-docflow}:${POSTGRES_PASSWORD:-docflow}@postgres:5432/${POSTGRES_DB:-docflow}
       REDIS_URL: redis://redis:6379/0
       UPLOAD_DIR: /data/uploads
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      # Local-dev convenience: exposes Flower's REST API without a login.
-      # Must NOT be set on a publicly reachable deployment (Phase 6).
-      FLOWER_UNAUTHENTICATED_API: "true"
     ports:
       - "${FLOWER_PORT:-5556}:5555"
     depends_on:
@@ -155,6 +231,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  miniodata:
   pgdata:
   redisdata:
   uploads:

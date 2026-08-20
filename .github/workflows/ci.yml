@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run on the same ref.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        # Same image the stack runs, so pgvector and its HNSW index behave
+        # identically here.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: docflow
+          POSTGRES_USER: docflow
+          POSTGRES_PASSWORD: docflow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U docflow -d docflow"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Tests run inside the `dev` image rather than on the runner directly.
+      #
+      # That image already carries tesseract, poppler, the Python
+      # dependencies and the embedding model, so this replaces an apt install,
+      # a pip install and a model download with one cached build - and it means
+      # CI exercises the artefact that actually ships rather than a lookalike
+      # assembled on the runner.
+      #
+      # The apt route was not just slower: installing tesseract on the runner
+      # hung for twenty minutes and took the whole job down with it.
+      - name: Build the test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev
+          load: true
+          tags: docflow-test:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start MinIO
+        # Not a service container: those cannot override an image's command,
+        # and minio/minio needs `server /data`. Running it as a step also keeps
+        # CI on the same image the local stack uses, rather than a third-party
+        # repackage whose tags can disappear underneath us.
+        timeout-minutes: 3
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=docflow \
+            -e MINIO_ROOT_PASSWORD=docflowsecret \
+            minio/minio:latest server /data
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              echo "MinIO ready after ${attempt} attempt(s)"
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "MinIO did not become ready" >&2
+              docker logs minio >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Create the bucket
+        # S3 buckets are not created implicitly on first write.
+        #
+        # Run inside the container that is already up: `mc` is bundled in the
+        # minio image, so this needs no second container and no entrypoint
+        # override. (minio/mc sets ENTRYPOINT ["mc"], which silently turns
+        # `sh -c ...` into `mc sh -c ...`.)
+        timeout-minutes: 2
+        run: |
+          docker exec minio mc alias set local http://127.0.0.1:9000 docflow docflowsecret
+          docker exec minio mc mb --ignore-existing local/docflow-uploads
+          docker exec minio mc ls local/
+
+      - name: Run migrations and tests
+        # --network host so the container reaches the service containers and
+        # MinIO on the runner's published ports.
+        timeout-minutes: 20
+        run: |
+          docker run --rm --network host \
+            -e DATABASE_URL="postgresql+psycopg2://docflow:docflow@127.0.0.1:5432/docflow" \
+            -e REDIS_URL="redis://127.0.0.1:6379/0" \
+            -e UPLOAD_DIR=/tmp/docflow-uploads \
+            -e S3_BUCKET=docflow-uploads \
+            -e S3_ENDPOINT_URL="http://127.0.0.1:9000" \
+            -e AWS_ACCESS_KEY_ID=docflow \
+            -e AWS_SECRET_ACCESS_KEY=docflowsecret \
+            -e AWS_REGION=us-east-1 \
+            docflow-test:ci \
+            sh -c "alembic upgrade head && pytest -q"
+
+      - name: MinIO logs on failure
+        if: failure()
+        run: docker logs minio
+
+  images:
+    name: Docker images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built but not pushed: this job exists to catch a broken Dockerfile
+      # before it breaks someone's `docker compose up`. The `dev` target is
+      # covered by the test job above.
+      - name: Build API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: api
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: worker
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build dashboard image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

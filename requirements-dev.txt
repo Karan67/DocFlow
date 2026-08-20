@@ -1,4 +1,7 @@
--r requirements.txt
+# Tests exercise the worker's pipeline, so they need the full processing set.
+-r requirements-worker.txt
+
 pytest>=8.3.0
 httpx>=0.27.0
+# Generates real PDFs for the fixtures rather than checking binaries into git.
 reportlab>=4.2.0

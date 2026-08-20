@@ -162,24 +162,47 @@ the full timeline — `Extract 2ms → "no usable text layer -> ocr"`,
 `OCR 784ms → 351 chars`, `Embed 248ms → 1 chunk`. Polling measured at exactly
 5 requests per 10s against a 2s interval, no console errors, CORS clean.
 
-## Phase 6 — Deploy ⬅ next
+## Phase 6 — Deploy ✅ built, deploy pending
 
-- S3 behind the existing `Storage` interface — a one-file change by design
-- AWS deploy (EC2 for API + worker, S3 for files)
-- GitHub Actions CI. Tests already run headless in the container, so this is
-  wiring rather than writing.
-- Split `requirements-dev.txt` out of the runtime image
-- Put auth in front of Flower and drop `FLOWER_UNAUTHENTICATED_API`
-- Split the API image from the worker's — the API needs neither tesseract nor
-  the embedding model, and the shared image is ~950MB
-- Trusted-proxy config so the rate limiter sees real client IPs rather than the
-  load balancer's
+- ✅ **S3 behind the existing `Storage` interface** — it really was a one-file
+  change, with no migration: `file_path` has held an opaque key since Phase 1.
+  Tested against MinIO rather than a mock, with the same assertions run against
+  both backends.
+- ✅ **Images split**: API 411MB, worker 976MB (was one ~950MB image for
+  everything). Only the workers need tesseract, poppler and the model, and the
+  API is what scales horizontally.
+- ✅ `requirements.txt` / `requirements-worker.txt` / `requirements-dev.txt`,
+  so test dependencies never reach a runtime image.
+- ✅ **GitHub Actions CI** — tests against real Postgres/Redis/MinIO service
+  containers, plus a job that builds all three images to catch a broken
+  Dockerfile before it breaks someone's `docker compose up`.
+- ✅ Flower behind basic auth; `FLOWER_UNAUTHENTICATED_API` gone.
+- ✅ Trusted-proxy handling, so the rate limiter cannot be bypassed by a
+  client-supplied `X-Forwarded-For`.
+- ✅ **The `PENDING` gap from Phase 5 is closed** — the reaper now revives jobs
+  that were committed but never enqueued, charging a retry so the loop is
+  bounded.
+- ✅ Production compose overlay + [DEPLOY.md](DEPLOY.md) runbook.
 
-**Known gap to close:** a job committed but never enqueued sits in `PENDING`
-forever. The reaper sweeps `PROCESSING`, not `PENDING`. In practice this only
-happens if the API dies between the commit and the `send_task`, but the fix is
-small — widen the sweep to `PENDING` rows older than a threshold with no
-`started_at`.
+**Done when:** the app runs on AWS. ⏳ Everything up to that point is built and
+verified — 102 tests green, the S3 backend exercised end-to-end through the
+real pipeline (30 objects written to MinIO), the split images built and
+running. The deploy itself is not done: it needs an AWS account and creates
+billable resources, so it is a deliberate step rather than something the repo
+triggers.
+
+Two findings worth keeping:
+- Splitting the images revealed that Celery's `imports` setting makes *every*
+  `celery -A` entrypoint load `worker.tasks` — so beat and flower need the
+  processing dependencies too, not just the worker pools.
+- The new `PENDING` sweep hit an illegal transition on its first run:
+  `PENDING → DEAD_LETTER` was not in the state machine, because until now
+  nothing could reach a terminal state without first being `PROCESSING`.
+
+Deliberately not built: Terraform/CDK (more code than the app for a
+single-environment deploy), an autoscaling policy (queue depth is already
+exposed via `GET /stats`; wiring it to CloudWatch is real work, not a config
+line), and a secrets manager. All noted in DEPLOY.md.
 
 ---
 
@@ -202,3 +225,5 @@ small — widen the sweep to `PENDING` rows older than a threshold with no
 | priority queues only | priority queues **plus** a dedicated `ocr` queue and pool | Priority reorders a queue; it does not stop a 60s task blocking a 2ms one. Only a separate pool does that |
 | "small files processed before large ones" | large files auto-demoted to `low` | Same intent, expressed as a default rather than a sort: the queue does the ordering, and an explicit priority can still override it |
 | dashboard hitting `GET /jobs` only | added `GET /stats` | Queue depth is the headline metric for a queue system and the browser cannot read Redis. `GET /jobs` alone cannot answer "are the workers keeping up" |
+| one image for every service | separate `api` / `worker` build targets | The API parses no documents. Shipping tesseract and a 130MB model to the service you scale horizontally is 565MB of dead weight per replica |
+| S3 tested with mocks | tested against MinIO | A mocked S3 test passes without proving the endpoint wiring works, or that `open()` returns something pypdf can seek in |
