@@ -91,6 +91,20 @@ class Settings(BaseSettings):
     #: Must match the model. Changing one without the other fails at insert
     #: time against the vector(N) column.
     EMBEDDING_DIM: int = 384
+    #: "local" runs the ONNX model in-process; "hosted" calls the same model id
+    #: over HTTP. Hosted costs a network round trip per batch but almost no CPU
+    #: and no model in memory, which is what lets a worker run on a fraction of
+    #: a core. Same model id means the same vector space, so switching backends
+    #: does not require re-embedding anything already indexed.
+    EMBEDDING_BACKEND: str = "local"
+    EMBEDDING_API_TOKEN: str = ""
+    #: Blank derives the HuggingFace inference URL from EMBEDDING_MODEL.
+    EMBEDDING_API_URL: str = ""
+    #: 128 measured fastest; larger batches gained nothing and made a failed
+    #: request more expensive to retry.
+    EMBEDDING_API_BATCH: int = 128
+    EMBEDDING_API_TIMEOUT: float = 60.0
+    EMBEDDING_API_RETRIES: int = 4
     CHUNK_SIZE: int = 800
     CHUNK_OVERLAP: int = 150
     EMBEDDING_BATCH_SIZE: int = 32
