@@ -1,7 +1,7 @@
 # Production overlay.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
-#     up -d api worker worker-ocr beat flower frontend
+#     up -d api worker worker-ocr beat flower flower-auth frontend
 #
 # Services are named explicitly because the base file also defines postgres,
 # redis and minio - in production those are RDS, ElastiCache and S3, not
@@ -69,9 +69,26 @@ services:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
       REDIS_URL: ${REDIS_URL:?set REDIS_URL}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # No --basic_auth and no published port: flower-auth below is the only way
+    # in, and it is the service that should sit behind the load balancer.
     command: >
       celery -A worker.celery_app flower --address=0.0.0.0 --port=5555
-      --basic_auth=${FLOWER_USER:?set FLOWER_USER}:${FLOWER_PASSWORD:?set FLOWER_PASSWORD}
+
+  flower-auth:
+    restart: always
+    volumes: []
+    build:
+      context: .
+      target: api
+    command: >
+      uvicorn flowerauth.main:app --host 0.0.0.0 --port 8080
+    environment:
+      FLOWER_URL: http://flower:5555
+      FLOWER_USER: ${FLOWER_USER:?set FLOWER_USER}
+      FLOWER_PASSWORD: ${FLOWER_PASSWORD:?set FLOWER_PASSWORD}
+      # Anyone holding this can mint a valid session cookie.
+      FLOWER_SESSION_SECRET: ${FLOWER_SESSION_SECRET:?set FLOWER_SESSION_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
   frontend:
     restart: always

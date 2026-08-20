@@ -197,23 +197,47 @@ services:
       target: ${WORKER_TARGET:-dev}
     container_name: docflow_flower
     init: true
-    # Basic auth covers the UI and the REST API together, which is why
-    # FLOWER_UNAUTHENTICATED_API is gone. Change the credentials before this is
-    # reachable from anywhere but localhost - Flower can revoke and terminate
-    # tasks, so it is an admin surface, not a status page.
+    # No --basic_auth and no published port: Flower is reachable only from
+    # inside the Docker network, and flower-auth below is the way in. Its own
+    # basic auth produced the browser's native credential dialog, which its
+    # timed dashboard refresh kept dismissing mid-typing.
     command: >
       celery -A worker.celery_app flower --address=0.0.0.0 --port=5555
-      --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
     environment:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-docflow}:${POSTGRES_PASSWORD:-docflow}@postgres:5432/${POSTGRES_DB:-docflow}
       REDIS_URL: redis://redis:6379/0
       UPLOAD_DIR: /data/uploads
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    ports:
-      - "${FLOWER_PORT:-5556}:5555"
+    expose:
+      - "5555"
     depends_on:
       redis:
         condition: service_healthy
+
+  flower-auth:
+    # Form login in front of Flower, holding the host port Flower used to.
+    # Runs on the lean api image: it is a small Starlette app and imports no
+    # Celery, so none of the processing dependencies apply.
+    build:
+      context: .
+      target: api
+    container_name: docflow_flower_auth
+    init: true
+    command: >
+      uvicorn flowerauth.main:app --host 0.0.0.0 --port 8080
+    environment:
+      FLOWER_URL: http://flower:5555
+      FLOWER_USER: ${FLOWER_USER:-admin}
+      FLOWER_PASSWORD: ${FLOWER_PASSWORD:-admin}
+      FLOWER_SESSION_SECRET: ${FLOWER_SESSION_SECRET:-dev-secret-change-me}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - .:/app
+    ports:
+      - "${FLOWER_PORT:-5556}:8080"
+    depends_on:
+      - flower
+    restart: unless-stopped
 
   frontend:
     build:

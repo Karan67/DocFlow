@@ -64,7 +64,7 @@ two never share a queue.
 | API | http://localhost:8001 | |
 | Swagger UI | http://localhost:8001/docs | Easiest way to try an upload |
 | Health | http://localhost:8001/health | Checks DB + broker; 503 if either is down |
-| Flower | http://localhost:5556 | Queue depth, task history, failures |
+| Flower | http://localhost:5556 | Queue depth, task history, failures. Sign in with `FLOWER_USER`/`FLOWER_PASSWORD` (default `admin`/`admin`) |
 | Postgres | `localhost:5433` | user/pass/db: `docflow` |
 | Redis | `localhost:6380` | |
 
@@ -168,6 +168,7 @@ core/       config, database session, models + state machine, storage      <- sh
 api/        FastAPI app, routes, stats, schemas, limiter                    <- producer
 worker/     celery_app, tasks (stage runner), extract, ocr, embed          <- consumer
 frontend/   Next.js dashboard (App Router, Tailwind)                       <- UI
+flowerauth/ login form + reverse proxy in front of Flower                  <- admin gate
 alembic/    migrations
 scripts/    container entrypoints
 tests/      unit (pure logic) + integration (full flow against Postgres)
@@ -420,8 +421,23 @@ never enqueued — the API dying between the two — was previously stuck foreve
 because no worker had ever claimed it. Reviving costs a retry, so a job whose
 enqueue keeps failing dead-letters rather than looping.
 
-**Flower has basic auth and is not internet-facing.** It can revoke and
-terminate tasks, so it is an admin surface, not a status page.
+**Flower sits behind a login page, not HTTP basic auth.** It can revoke and
+terminate tasks, so it is an admin surface rather than a status page - but
+`--basic_auth` hands the browser its native credential dialog, and Flower's
+dashboard refreshes on a timer, so the dialog gets dismissed and redrawn while
+you are still typing into it.
+
+So Flower now runs unauthenticated on the internal network and is **not
+published to the host at all**. [flowerauth/](flowerauth/main.py) holds the
+port instead: a small Starlette app that serves a real form, sets a signed
+session cookie, and reverse-proxies everything through. Flower's UI is plain
+HTTP - it polls over AJAX and registers no websocket handlers - so a
+request/response proxy is enough.
+
+It runs on the lean `api` image, since it imports no Celery. Two details worth
+noting: `?next=` is restricted to relative paths so it cannot become an open
+redirect into an admin UI, and the session cookie is stripped before requests
+are forwarded to Flower, which has no use for it.
 
 ---
 
@@ -435,8 +451,8 @@ Tests run in the **worker** container, not the API one: they drive the full
 pipeline, and the API image deliberately does not carry tesseract, poppler or
 the embedding model.
 
-102 tests: extraction, OCR-routing, chunking and queue-routing unit tests (no
-DB or broker),
+120 tests: extraction, OCR-routing, chunking, queue-routing and Flower-auth
+unit tests (no DB or broker),
 the full upload → DONE flow, Phase 2's reliability behaviour — retry-then-succeed,
 dead-lettering, permanent failures skipping retries, backoff growth and jitter,
 deduplication, reclaiming orphaned work, the reaper — and Phase 3's pipeline:
@@ -506,8 +522,12 @@ it should not be. `worker` must not include `ocr` in its `-Q` list.
 `worker_prefetch_multiplier` is 1. Either one missing silently degrades
 priority to round-robin.
 
-**Flower asks for a password** — it does now. Default `admin`/`admin` locally,
-set via `FLOWER_USER` / `FLOWER_PASSWORD`.
+**Flower shows a login page** — it does now, at http://localhost:5556. Default
+`admin`/`admin`, set via `FLOWER_USER` / `FLOWER_PASSWORD`. Flower itself is no
+longer published to the host; reach it through that page.
+
+**Flower login does not stick** — the session cookie is signed with
+`FLOWER_SESSION_SECRET`. If it changes, every existing session is invalidated.
 
 **`ModuleNotFoundError` in beat or flower** — they were built from the `api`
 target. Celery loads `worker.tasks` in every `celery -A` entrypoint, so they
