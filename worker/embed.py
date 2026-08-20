@@ -82,8 +82,21 @@ def embed_chunks(chunks: list[str]) -> list[list[float]]:
     if not chunks:
         return []
 
+    backend = (settings.EMBEDDING_BACKEND or "local").strip().lower()
+    if backend not in ("local", "hosted"):
+        raise EmbeddingError(
+            f"Unknown EMBEDDING_BACKEND {backend!r}; expected 'local' or 'hosted'."
+        )
+
     try:
-        vectors = [list(map(float, v)) for v in get_model().embed(chunks)]
+        if backend == "hosted":
+            # Imported lazily so a local-backend worker never pays for httpx
+            # setup, and so a missing token surfaces only when actually used.
+            from worker.embed_backend import embed_hosted
+
+            vectors = embed_hosted(chunks)
+        else:
+            vectors = [list(map(float, v)) for v in get_model().embed(chunks)]
     except Exception as exc:
         raise EmbeddingError(f"Embedding failed: {type(exc).__name__}: {exc}") from exc
 
